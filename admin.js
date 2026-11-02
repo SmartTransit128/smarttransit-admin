@@ -18,6 +18,7 @@ const PACKAGE_NAMES = {
   "pkg-monthly": "Monthly Basic",
   "pkg-3month": "Three-Month Growth",
   "pkg-6month": "Six-Month Partner",
+  "pkg-trial": "Free trial",
 };
 // Names admins set in the catalog (name_en) win over the built-in ones.
 const catalogNames = {};
@@ -558,12 +559,15 @@ async function renderCustomer(root, id) {
   const subsBlock = subs.status === "rejected" ? loadError(subs.reason)
     : !subRows.length ? h("div", { class: "table-wrap" }, h("div", { class: "empty" }, "No packages yet."))
     : h("div", { class: "table-wrap" }, h("table", {},
-      h("thead", {}, h("tr", {}, h("th", {}, "Package"), h("th", {}, "Listings"), h("th", {}, "Started"), h("th", {}, "Ends"), h("th", {}, "Status"))),
+      h("thead", {}, h("tr", {}, h("th", {}, "Package"), h("th", {}, "Listings"), h("th", {}, "Customer numbers used"), h("th", {}, "Started"), h("th", {}, "Ends"), h("th", {}, "Status"))),
       h("tbody", {}, subRows.map((s) => {
         const active = s.status === "active" && new Date(s.expires_at).getTime() > now;
         return h("tr", {},
           h("td", {}, packageName(s.package_id)),
           h("td", {}, count(s.listing_allowance)),
+          h("td", {}, s.contact_allowance == null
+            ? "Unlimited"
+            : `${count(s.contacts_used || 0)} of ${count(s.contact_allowance)}`),
           h("td", {}, fmtDate(s.starts_at, false)),
           h("td", {}, fmtDate(s.expires_at)),
           h("td", {}, h("span", { class: `badge ${active ? "ok" : "grey"}` }, active ? "Active" : "Expired")));
@@ -617,6 +621,10 @@ function packageEditor(pkg) {
   const [price, priceLabel] = field("Price (TZS)", pkg.amount, { min: "500", step: "500" });
   const [listings, listingsLabel] = field("Listings allowed", pkg.listing_allowance, { min: "1", max: "500" });
   const [days, daysLabel] = field("Duration (days)", pkg.validity_days, { min: "1", max: "730" });
+  const [contacts, contactsLabel] = field("Customer numbers", pkg.contact_allowance ?? "", { min: "1", max: "5000" });
+  // A top-up adds customer numbers to a running package: no listings, and it
+  // ends with that package.
+  const topUp = pkg.kind === "topup";
   priceLabel.classList.add("full");
   const active = h("input", { type: "checkbox" });
   active.checked = pkg.active !== false;
@@ -628,24 +636,33 @@ function packageEditor(pkg) {
 
   const values = () => ({
     amount: Number(price.value.replace(/,/g, "").trim()),
-    listing_allowance: Number(listings.value.trim()),
-    validity_days: Number(days.value.trim()),
+    ...(topUp ? {} : {
+      listing_allowance: Number(listings.value.trim()),
+      validity_days: Number(days.value.trim()),
+    }),
+    // Empty = unlimited, only for packages that never had a limit.
+    ...(contacts.value.trim() === "" && saved.contact_allowance == null
+      ? {}
+      : { contact_allowance: Number(contacts.value.trim()) }),
     active: active.checked,
   });
   const changed = () => {
     const v = values();
-    return v.amount !== saved.amount || v.listing_allowance !== saved.listing_allowance ||
-      v.validity_days !== saved.validity_days || v.active !== (saved.active !== false);
+    return v.amount !== saved.amount ||
+      (!topUp && (v.listing_allowance !== saved.listing_allowance || v.validity_days !== saved.validity_days)) ||
+      ("contact_allowance" in v && v.contact_allowance !== saved.contact_allowance) ||
+      v.active !== (saved.active !== false);
   };
   const refresh = () => { saveBtn.disabled = !changed(); updateSaleLabel(); };
-  [price, listings, days].forEach((i) => i.addEventListener("input", refresh));
+  [price, listings, days, contacts].forEach((i) => i.addEventListener("input", refresh));
   active.addEventListener("change", refresh);
 
   saveBtn.addEventListener("click", async () => {
     const v = values();
     if (!Number.isInteger(v.amount) || v.amount < 500) { toast("Price must be a whole number of at least TZS 500.", true); return; }
-    if (!Number.isInteger(v.listing_allowance) || v.listing_allowance < 1 || v.listing_allowance > 500) { toast("Listings must be between 1 and 500.", true); return; }
-    if (!Number.isInteger(v.validity_days) || v.validity_days < 1 || v.validity_days > 730) { toast("Duration must be between 1 and 730 days.", true); return; }
+    if (!topUp && (!Number.isInteger(v.listing_allowance) || v.listing_allowance < 1 || v.listing_allowance > 500)) { toast("Listings must be between 1 and 500.", true); return; }
+    if (!topUp && (!Number.isInteger(v.validity_days) || v.validity_days < 1 || v.validity_days > 730)) { toast("Duration must be between 1 and 730 days.", true); return; }
+    if ("contact_allowance" in v && (!Number.isInteger(v.contact_allowance) || v.contact_allowance < 1 || v.contact_allowance > 5000)) { toast("Customer numbers must be between 1 and 5000.", true); return; }
     if (!v.active && saved.active !== false) {
       const ok = await confirmDialog({
         title: `Stop selling ${packageName(pkg.id)}?`,
@@ -676,7 +693,7 @@ function packageEditor(pkg) {
     h("div", { class: "pkg-head" },
       h("h3", {}, packageName(pkg.id)),
       h("label", { class: "switch" }, onSale, active)),
-    h("div", { class: "pkg-fields" }, priceLabel, listingsLabel, daysLabel),
+    h("div", { class: "pkg-fields" }, priceLabel, ...(topUp ? [] : [listingsLabel, daysLabel]), contactsLabel),
     h("div", { class: "pkg-foot" }, updated, saveBtn));
 }
 
