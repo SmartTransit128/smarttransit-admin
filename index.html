@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src https://fpavhievwedzyqbfooic.supabase.co; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'self'; form-action 'self'">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#de6e1a">
+<title>SmartTransit Admin</title>
+<link rel="icon" href="favicon.png">
+<link rel="stylesheet" href="admin.css">
+<script src="admin.js" defer></script>
+</head>
+<body>
+
+<!-- Sign in -->
+<section id="signin-view" class="signin" hidden>
+  <form id="signin-form" class="signin-card" novalidate>
+    <div class="brand big"><img src="favicon.png" alt="">SmartTransit <span>Admin</span></div>
+    <p class="muted">Sign in with your SmartTransit admin account (same email and password as the app).</p>
+    <label>Email
+      <input id="signin-email" type="email" autocomplete="username" required>
+    </label>
+    <label>Password
+      <input id="signin-password" type="password" autocomplete="current-password" required>
+    </label>
+    <p id="signin-error" class="error" hidden></p>
+    <button id="signin-btn" class="btn primary wide" type="submit">Sign in</button>
+  </form>
+</section>
+
+<!-- Dashboard -->
+<div id="app-view" class="shell" hidden>
+  <aside class="sidebar">
+    <div class="brand"><img src="favicon.png" alt="">SmartTransit <span>Admin</span></div>
+    <nav id="nav">
+      <a href="#overview" data-view="overview">Overview</a>
+      <a href="#payments" data-view="payments">Payments</a>
+      <a href="#customers" data-view="customers">Customers</a>
+      <a href="#packages" data-view="packages">Packages &amp; prices</a>
+      <a href="#insights" data-view="insights">Insights</a>
+      <a href="#posts" data-view="posts">Posts</a>
+    </nav>
+    <div class="who">
+      <div id="who-name" class="who-name"></div>
+      <div id="who-email" class="muted small"></div>
+      <button id="signout-btn" class="btn ghost small" type="button">Sign out</button>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="topbar">
+      <h1 id="view-title">Overview</h1>
+      <button id="refresh-btn" class="btn ghost" type="button">Refresh</button>
+    </header>
+    <div id="view" class="view"></div>
+  </main>
+</div>
+
+<!-- Modal -->
+<div id="modal" class="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <button id="modal-close" class="modal-x" type="button" aria-label="Close">×</button>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+</body>
+</html>
