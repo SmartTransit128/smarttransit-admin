@@ -204,3 +204,17 @@ td .sub { color: var(--muted); font-size: 13px; }
 .load-error { padding: 30px; text-align: center; }
 .load-error p { color: var(--bad); }
 .modal-card .detail-head { padding-right: 28px; }
+
+/* Offers */
+.form { display: grid; gap: 14px; }
+.form label select, .form label input { margin-top: 5px; color: var(--ink); font-weight: 400; }
+.offer-preview { background: #fcfaf7; }
+.offer-preview .list-row { padding: 7px 0; font-size: 14px; }
+.offer-preview s { margin-right: 6px; }
+.picker { display: grid; gap: 8px; }
+.picker-search { display: flex; gap: 8px; }
+.picker-results { display: grid; gap: 4px; max-height: 200px; overflow: auto; }
+.picker-row { font: inherit; text-align: left; display: grid; gap: 1px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; cursor: pointer; }
+.picker-row:hover { border-color: var(--orange); background: var(--orange-soft); }
+.chip-x { border: 0; background: none; color: inherit; font-size: 15px; cursor: pointer; padding: 0 0 0 4px; line-height: 1; }
+.modal-card { max-width: 560px; }

@@ -19,13 +19,26 @@ const PACKAGE_NAMES = {
   "pkg-3month": "Three-Month Growth",
   "pkg-6month": "Six-Month Partner",
 };
-const packageName = (id) => PACKAGE_NAMES[id] || id || "—";
+// Names admins set in the catalog (name_en) win over the built-in ones.
+const catalogNames = {};
+const packageName = (id) => catalogNames[id] || PACKAGE_NAMES[id] || id || "—";
+
+async function loadCatalogNames() {
+  try {
+    const rows = await rest("package_catalog?select=*&order=sort_order");
+    for (const r of rows || []) if (r.name_en) catalogNames[r.id] = r.name_en;
+    return rows || [];
+  } catch {
+    return null;
+  }
+}
 
 const VIEWS = {
   overview: { title: "Overview", render: renderOverview },
   payments: { title: "Payments", render: renderPayments },
   customers: { title: "Customers", render: renderCustomers },
   packages: { title: "Packages & prices", render: renderPackages },
+  offers: { title: "Offers", render: renderOffers },
   insights: { title: "Insights", render: renderInsights },
   posts: { title: "Posts", render: renderPosts },
 };
@@ -284,6 +297,7 @@ async function enterApp() {
   $("who-email").textContent = me.email || s.email;
   $("signin-view").hidden = true;
   $("app-view").hidden = false;
+  await loadCatalogNames();
   route();
 }
 
@@ -566,7 +580,9 @@ async function renderCustomer(root, id) {
         h("dt", {}, "Role"), h("dd", {}, roleLabel(c.role)),
         h("dt", {}, "Language"), h("dd", {}, c.default_language === "sw" ? "Swahili" : "English"),
         h("dt", {}, "Joined"), h("dd", {}, fmtDate(c.created_at)),
-        h("dt", {}, "User ID"), h("dd", { class: "small" }, c.id))),
+        h("dt", {}, "User ID"), h("dd", { class: "small" }, c.id)),
+      h("div", { class: "modal-actions" },
+        h("button", { class: "btn primary", type: "button", onclick: () => openOfferForm(null, [c]) }, "Give an offer"))),
     h("h2", {}, "Packages"),
     subsBlock,
     h("h2", {}, "Payments"),
@@ -662,6 +678,262 @@ function packageEditor(pkg) {
       h("label", { class: "switch" }, onSale, active)),
     h("div", { class: "pkg-fields" }, priceLabel, listingsLabel, daysLabel),
     h("div", { class: "pkg-foot" }, updated, saveBtn));
+}
+
+// ── Offers ────────────────────────────────────────────────────────────────
+//
+// A percentage off one package or all of them, for everyone or for chosen
+// customers, between two dates. The checkout always charges the best live
+// offer for that buyer (package_prices_for in the database), so what's set
+// here is exactly what people pay.
+
+const OFFER_SELECT = "*,recipients:package_offer_recipients(count)";
+
+function offersMissing(err) {
+  return err && (err.status === 404 || /could not find the table/i.test(err.message || ""));
+}
+
+function offersNotLive() {
+  return h("div", { class: "card" },
+    h("h2", { style: { marginTop: "0" } }, "Offers aren't switched on in the database yet"),
+    h("p", { class: "muted" },
+      "The database update that adds offers (migration 20261103090000_package_admin_and_offers) " +
+      "hasn't been applied to the live database. Once it is, you can create offers here."));
+}
+
+function offerState(o) {
+  const now = Date.now();
+  if (!o.active) return ["Paused", "grey"];
+  if (o.ends_at && new Date(o.ends_at).getTime() <= now) return ["Ended", "grey"];
+  if (new Date(o.starts_at).getTime() > now) return ["Scheduled", "warn"];
+  return ["Live", "ok"];
+}
+
+/// Same rounding as the database: nearest TZS 100, never below TZS 500.
+function offerPrice(amount, percentOff) {
+  return Math.max(500, Math.round((amount * (100 - percentOff)) / 10000) * 100);
+}
+
+async function renderOffers(root) {
+  root.append(
+    h("div", { class: "toolbar" },
+      h("button", { class: "btn primary", type: "button", onclick: () => openOfferForm(null, []) }, "New offer")),
+    h("p", { class: "muted small" },
+      "Buyers automatically get the best live offer that applies to them, in the app and on the website. " +
+      "Prices are rounded to the nearest TZS 100 and never go below TZS 500."));
+  const list = h("div", {}, loading());
+  root.append(list);
+  let offers;
+  try {
+    offers = await rest(`package_offers?select=${OFFER_SELECT}&order=created_at.desc`);
+  } catch (err) {
+    list.replaceChildren(offersMissing(err) ? offersNotLive() : loadError(err, () => route()));
+    return;
+  }
+  if (!offers.length) {
+    list.replaceChildren(h("div", { class: "table-wrap" }, h("div", { class: "empty" }, "No offers yet. Create one with “New offer”.")));
+    return;
+  }
+  list.replaceChildren(h("div", { class: "table-wrap" }, h("table", {},
+    h("thead", {}, h("tr", {},
+      h("th", {}, "Offer"), h("th", {}, "Discount"), h("th", {}, "Who"), h("th", {}, "When"), h("th", {}, "Status"), h("th", {}, ""))),
+    h("tbody", {}, offers.map((o) => {
+      const [label, tone] = offerState(o);
+      const recipients = num(o.recipients?.[0]?.count);
+      return h("tr", { class: "click", onclick: (e) => { if (!e.target.closest("button")) openOfferForm(o); } },
+        h("td", {}, o.title),
+        h("td", {}, `${o.percent_off}% off`, h("div", { class: "sub" }, o.package_id ? packageName(o.package_id) : "All packages")),
+        h("td", {}, o.audience === "selected" ? `${recipients} chosen customer${recipients === 1 ? "" : "s"}` : "Everyone"),
+        h("td", {}, fmtDate(o.starts_at), h("div", { class: "sub" }, o.ends_at ? `until ${fmtDate(o.ends_at)}` : "no end date")),
+        h("td", {}, h("span", { class: `badge ${tone}` }, label)),
+        h("td", { class: "num" },
+          h("button", { class: "btn small", type: "button", onclick: () => setOfferActive(o, !o.active) }, o.active ? "Pause" : "Resume")));
+    })))));
+}
+
+async function setOfferActive(o, active) {
+  try {
+    await rest(`package_offers?id=eq.${enc(o.id)}`, { method: "PATCH", body: { active } });
+    toast(active ? "Offer resumed." : "Offer paused.");
+    route();
+  } catch (err) {
+    toast(`Couldn't update. ${errorText(err)}`, true);
+  }
+}
+
+/// For <input type="datetime-local">: the browser's local time, no seconds.
+function toLocalInput(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/// Create (offer = null) or edit an offer. [presetRecipients] pre-selects
+/// customers, e.g. from a customer's page.
+async function openOfferForm(offer, presetRecipients = []) {
+  openModal(loading());
+  const [catalogRes, recipientsRes] = await Promise.allSettled([
+    loadCatalogNames(),
+    offer && offer.audience === "selected"
+      ? rest(`package_offer_recipients?offer_id=eq.${enc(offer.id)}&select=user:profiles(id,full_name,email,phone)`)
+      : Promise.resolve([]),
+  ]);
+  const catalog = (catalogRes.status === "fulfilled" && catalogRes.value) || [];
+  if (recipientsRes.status === "rejected") {
+    openModal(offersMissing(recipientsRes.reason) ? offersNotLive() : loadError(recipientsRes.reason));
+    return;
+  }
+  const chosen = new Map();
+  for (const r of recipientsRes.value) if (r.user) chosen.set(r.user.id, r.user);
+  for (const c of presetRecipients) chosen.set(c.id, c);
+
+  const title = h("input", { type: "text", maxlength: "80", placeholder: "e.g. Launch week special", value: offer?.title || "" });
+  const percent = h("input", { type: "number", min: "1", max: "90", step: "1", inputmode: "numeric", value: String(offer?.percent_off ?? 20) });
+  const pkg = h("select", {},
+    h("option", { value: "" }, "All packages"),
+    catalog.map((c) => h("option", { value: c.id }, `${packageName(c.id)}${c.active === false ? " (not on sale)" : ""}`)));
+  pkg.value = offer?.package_id || "";
+  const starts = h("input", { type: "datetime-local", value: toLocalInput(offer?.starts_at || new Date()) });
+  const ends = h("input", { type: "datetime-local", value: toLocalInput(offer?.ends_at) });
+  const audience = h("select", {},
+    h("option", { value: "all" }, "Everyone"),
+    h("option", { value: "selected" }, "Only customers I choose"));
+  audience.value = offer ? offer.audience : (presetRecipients.length ? "selected" : "all");
+  const active = h("input", { type: "checkbox" });
+  active.checked = offer ? offer.active !== false : true;
+
+  // Price preview
+  const preview = h("div", { class: "card offer-preview" });
+  function drawPreview() {
+    const p = Math.trunc(Number(percent.value));
+    const rows = catalog.filter((c) => !pkg.value || c.id === pkg.value);
+    if (!(p >= 1 && p <= 90) || !rows.length) { preview.replaceChildren(h("span", { class: "muted small" }, "Enter a discount between 1% and 90% to see the new prices.")); return; }
+    preview.replaceChildren(h("div", { class: "chart-title" }, "New prices"), ...rows.map((c) => h("div", { class: "list-row" },
+      h("span", {}, packageName(c.id)),
+      h("span", {}, h("s", { class: "muted" }, tzs(c.amount)), "  ", h("b", {}, tzs(offerPrice(c.amount, p)))))));
+  }
+  [percent, pkg].forEach((el) => el.addEventListener("input", drawPreview));
+  drawPreview();
+
+  // Customer picker (only for "Only customers I choose")
+  const chips = h("div", { class: "chips" });
+  function drawChips() {
+    chips.replaceChildren(...[...chosen.values()].map((c) => h("span", { class: "chip on" },
+      c.full_name || c.email || c.phone || "Customer", " ",
+      h("button", { type: "button", class: "chip-x", "aria-label": "Remove", onclick: () => { chosen.delete(c.id); drawChips(); } }, "×"))));
+    if (!chosen.size) chips.append(h("span", { class: "muted small" }, "No customers chosen yet."));
+  }
+  const findInput = h("input", { type: "search", placeholder: "Search name, email or phone" });
+  const results = h("div", { class: "picker-results" });
+  const findBtn = h("button", { class: "btn", type: "button" }, "Find");
+  async function find() {
+    const q = findInput.value.trim().replace(/[,()%*\\:."']/g, "");
+    if (!q) return;
+    results.replaceChildren(loading());
+    try {
+      const rows = await rest(`profiles?select=id,full_name,email,phone&or=(${["full_name", "email", "phone"].map((f) => `${f}.ilike.*${enc(q)}*`).join(",")})&order=created_at.desc&limit=20`);
+      results.replaceChildren(...(rows.length ? rows.map((c) => h("button", {
+        type: "button", class: "picker-row",
+        onclick: () => { chosen.set(c.id, c); drawChips(); },
+      }, h("b", {}, c.full_name || "—"), h("span", { class: "muted small" }, [c.email, c.phone].filter(Boolean).join(" · ")))) : [h("div", { class: "muted small" }, "No one found.")]));
+    } catch (err) {
+      results.replaceChildren(h("div", { class: "error" }, errorText(err)));
+    }
+  }
+  findBtn.addEventListener("click", find);
+  findInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); find(); } });
+  const picker = h("div", { class: "picker" },
+    h("label", {}, "Customers who get this offer"), chips,
+    h("div", { class: "picker-search" }, findInput, findBtn), results);
+  const syncAudience = () => { picker.hidden = audience.value !== "selected"; };
+  audience.addEventListener("change", syncAudience);
+  drawChips();
+  syncAudience();
+
+  const error = h("p", { class: "error", hidden: true });
+  const saveBtn = h("button", { class: "btn primary", type: "button" }, offer ? "Save changes" : "Create offer");
+  saveBtn.addEventListener("click", async () => {
+    const fail = (msg) => { error.textContent = msg; error.hidden = false; };
+    error.hidden = true;
+    const p = Number(percent.value);
+    const start = starts.value ? new Date(starts.value) : new Date();
+    const end = ends.value ? new Date(ends.value) : null;
+    if (!title.value.trim()) return fail("Give the offer a name.");
+    if (!Number.isInteger(p) || p < 1 || p > 90) return fail("The discount must be a whole number between 1% and 90%.");
+    if (Number.isNaN(start.getTime()) || (end && Number.isNaN(end.getTime()))) return fail("Check the start and end dates.");
+    if (end && end <= start) return fail("The end must be after the start.");
+    if (audience.value === "selected" && !chosen.size) return fail("Choose at least one customer, or set “Who” to Everyone.");
+
+    const body = {
+      title: title.value.trim(),
+      package_id: pkg.value || null,
+      percent_off: p,
+      starts_at: start.toISOString(),
+      ends_at: end ? end.toISOString() : null,
+      audience: audience.value,
+      active: active.checked,
+    };
+    saveBtn.disabled = true;
+    saveBtn.replaceChildren(h("span", { class: "spinner" }), "Saving…");
+    try {
+      let id = offer?.id;
+      if (id) {
+        await rest(`package_offers?id=eq.${enc(id)}`, { method: "PATCH", body });
+      } else {
+        const rows = await rest("package_offers?select=id", { method: "POST", body, prefer: "return=representation" });
+        id = rows[0].id;
+      }
+      // Set exactly who gets it.
+      await rest(`package_offer_recipients?offer_id=eq.${enc(id)}`, { method: "DELETE" });
+      if (audience.value === "selected") {
+        await rest("package_offer_recipients", {
+          method: "POST", body: [...chosen.keys()].map((u) => ({ offer_id: id, user_id: u })),
+        });
+      }
+      toast(offer ? "Offer saved." : "Offer created.");
+      if (location.hash === "#offers") route(); else location.hash = "offers";
+    } catch (err) {
+      fail(offersMissing(err) ? "Offers aren't switched on in the database yet." : `Couldn't save. ${errorText(err)}`);
+      saveBtn.disabled = false;
+      saveBtn.replaceChildren(offer ? "Save changes" : "Create offer");
+    }
+  });
+
+  const deleteBtn = offer && h("button", { class: "btn danger", type: "button", onclick: async () => {
+    const ok = await confirmDialog({
+      title: `Delete “${offer.title}”?`,
+      body: "Nobody will get this discount any more. Payments already made with it are not affected. To stop it for now and keep it for later, use Pause instead.",
+      confirmLabel: "Delete offer", danger: true,
+    });
+    if (!ok) { openOfferForm(offer); return; }
+    try {
+      await rest(`package_offers?id=eq.${enc(offer.id)}`, { method: "DELETE" });
+      toast("Offer deleted.");
+      route();
+    } catch (err) {
+      toast(`Couldn't delete. ${errorText(err)}`, true);
+    }
+  } }, "Delete");
+
+  openModal(
+    h("h2", { style: { marginTop: "0" } }, offer ? "Edit offer" : "New offer"),
+    h("div", { class: "form" },
+      h("label", {}, "Name (shown to buyers)", title),
+      h("div", { class: "pkg-fields" },
+        h("label", {}, "Discount (%)", percent),
+        h("label", {}, "Package", pkg),
+        h("label", {}, "Starts", starts),
+        h("label", {}, "Ends (leave empty for no end)", ends)),
+      h("label", {}, "Who gets it", audience),
+      picker,
+      preview,
+      h("label", { class: "switch" }, active, "Active (turn off to pause)"),
+      error),
+    h("div", { class: "modal-actions" },
+      deleteBtn,
+      h("button", { class: "btn", type: "button", onclick: closeModal }, "Cancel"),
+      saveBtn));
 }
 
 // ── Insights ──────────────────────────────────────────────────────────────
