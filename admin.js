@@ -1,4 +1,4 @@
-// SmartTransit admin dashboard.
+// TeleTransit admin dashboard.
 //
 // A static page that talks to the same Supabase database as the app, using
 // the public (publishable) key plus the admin's own sign-in. Nothing secret
@@ -19,6 +19,16 @@ const PACKAGE_NAMES = {
   "pkg-3month": "Three-Month Growth",
   "pkg-6month": "Six-Month Partner",
   "pkg-trial": "Free trial",
+  "pkg-plan-daily": "Daily",
+  "pkg-plan-weekly": "Weekly",
+  "pkg-plan-monthly": "Monthly",
+  "pkg-plan-quarterly": "Quarterly",
+  "pkg-plan-annual": "Annual",
+  "pkg-bundle-basic": "Basic bundle",
+  "pkg-bundle-standard": "Standard bundle",
+  "pkg-bundle-plus": "Plus bundle",
+  "pkg-bundle-premium": "Premium bundle",
+  "pkg-topup-10": "10 more customer numbers",
 };
 // Names admins set in the catalog (name_en) win over the built-in ones.
 const catalogNames = {};
@@ -36,12 +46,16 @@ async function loadCatalogNames() {
 
 const VIEWS = {
   overview: { title: "Overview", render: renderOverview },
+  business: { title: "Business", render: renderBusiness },
+  partners: { title: "Partners", render: renderPartners },
+  payouts: { title: "Payouts", render: renderPayouts },
   payments: { title: "Payments", render: renderPayments },
   customers: { title: "Customers", render: renderCustomers },
   packages: { title: "Packages & prices", render: renderPackages },
   offers: { title: "Offers", render: renderOffers },
   insights: { title: "Insights", render: renderInsights },
   posts: { title: "Posts", render: renderPosts },
+  settings: { title: "Settings", render: renderSettings },
 };
 
 // ── Small helpers ─────────────────────────────────────────────────────────
@@ -60,7 +74,7 @@ function h(tag, attrs, ...children) {
     else if (v === true) el.setAttribute(k, "");
     else el.setAttribute(k, v);
   }
-  for (const c of children.flat()) {
+  for (const c of children.flat(Infinity)) {
     if (c == null || c === false) continue;
     el.append(c instanceof Node ? c : String(c));
   }
@@ -100,6 +114,13 @@ function loadError(err, retry) {
     retry && h("button", { class: "btn", type: "button", onclick: retry }, "Try again"));
 }
 
+/// A stat tile that opens a page.
+function linkStat(label, value, href, tone) {
+  return h("a", { class: `stat link ${tone || ""}`, href },
+    h("div", { class: "value" }, value),
+    h("div", { class: "label" }, label, " →"));
+}
+
 function stat(label, value, tone) {
   return h("div", { class: `stat ${tone || ""}` },
     h("div", { class: "value" }, value),
@@ -110,6 +131,7 @@ function statusBadge(status, isMock) {
   const map = {
     completed: ["Paid", "ok"], pending: ["Waiting", "warn"],
     failed: ["Failed", "bad"], cancelled: ["Cancelled", "grey"],
+    refunded: ["Refunded", "blue"],
   };
   const [label, tone] = map[status] || [status || "—", "grey"];
   return h("span", {},
@@ -254,6 +276,10 @@ function rpc(name, params = {}) {
   }));
 }
 
+function edgeGet(name) {
+  return withAuth((headers) => http(`${SUPABASE_URL}/functions/v1/${name}`, { headers }));
+}
+
 function edgeFunction(name, body) {
   return withAuth((headers) => http(`${SUPABASE_URL}/functions/v1/${name}`, {
     method: "POST",
@@ -320,7 +346,8 @@ function route() {
 // ── Modal ─────────────────────────────────────────────────────────────────
 
 function openModal(...content) {
-  $("modal-body").replaceChildren(...content);
+  // Optional parts may be null/false: leave them out (never print "null").
+  $("modal-body").replaceChildren(...content.flat(Infinity).filter((c) => c != null && c !== false));
   $("modal").hidden = false;
 }
 function closeModal() { $("modal").hidden = true; }
@@ -342,10 +369,11 @@ function confirmDialog({ title, body, confirmLabel, danger }) {
 
 async function renderOverview(root) {
   root.append(loading());
-  const [summary, latest, insights] = await Promise.allSettled([
+  const [summary, latest, insights, business] = await Promise.allSettled([
     rpc("admin_payment_summary"),
     rest(`payment_orders?select=${PAYMENT_SELECT}&order=created_at.desc&limit=8`),
     rpc("admin_insights"),
+    rpc("admin_business_report", { p_days: 30 }),
   ]);
   root.replaceChildren();
   if (summary.status === "rejected") {
@@ -363,6 +391,20 @@ async function renderOverview(root) {
       stat("Active packages", count(s.active_packages)),
       stat("Customers", count(s.customers))),
   );
+
+  if (business.status === "fulfilled") {
+    const b = business.value || {};
+    const c = b.commissions || {}, u = b.users || {};
+    root.append(
+      h("h2", {}, "Partners & payouts"),
+      h("div", { class: "stats" },
+        linkStat("Payouts waiting", count(c.waiting_count), "#payouts", num(c.waiting_count) ? "warn" : ""),
+        linkStat("Owed to partners", tzs(c.owed), "#partners", "money"),
+        linkStat("Active partners", count(u.partners), "#partners"),
+        stat("Referred users", count(u.referred)),
+        stat("Credits not yet used", count(u.credits_outstanding))),
+    );
+  }
 
   if (insights.status === "fulfilled") {
     const d = insights.value || {};
@@ -393,7 +435,7 @@ function renderPayments(root) {
     placeholder: "Search receipt no., reference, name, email or phone",
     oninput: () => { paymentsState.search = search.value; draw(); },
   });
-  const filters = [[null, "All"], ["completed", "Paid"], ["pending", "Waiting"], ["failed", "Failed"], ["cancelled", "Cancelled"]];
+  const filters = [[null, "All"], ["completed", "Paid"], ["pending", "Waiting"], ["failed", "Failed"], ["cancelled", "Cancelled"], ["refunded", "Refunded"]];
   const chips = h("div", { class: "chips" }, filters.map(([value, label]) => h("button", {
     type: "button", class: `chip ${paymentsState.status === value ? "on" : ""}`,
     onclick: () => { paymentsState.status = value; route(); },
@@ -444,6 +486,7 @@ function paymentsTable(rows, showCustomer) {
 
 function methodLabel(p) {
   if (p.method === "appleIap") return "Apple In-App Purchase";
+  if (p.method === "azampay") return p.payment_method_code ? `AzamPay · ${p.payment_method_code}` : "AzamPay";
   if (p.method === "mock") return "Test (no money)";
   return p.payment_method_code ? `Pesapal · ${p.payment_method_code}` : "Pesapal";
 }
@@ -490,9 +533,54 @@ function openPayment(p) {
         c.email ? h("div", { class: "sub muted" }, c.email) : null,
         c.phone ? h("div", { class: "sub muted" }, c.phone) : null)),
     h("div", { class: "modal-actions" },
-      p.order_tracking_id && p.method !== "appleIap" && p.status !== "completed" ? recheck : null,
+      p.status === "completed" && !p.is_mock
+        ? h("button", { class: "btn danger", type: "button", onclick: () => openRefund(p) }, "Refund…")
+        : null,
+      p.order_tracking_id && p.method === "pesapal" && !["completed", "refunded"].includes(p.status) ? recheck : null,
       h("button", { class: "btn", type: "button", onclick: closeModal }, "Close")),
   );
+}
+
+/// Records a refund made in Pesapal's or AzamPay's portal and takes back
+/// what it bought (package ended, unused credits removed, commission reversed).
+function openRefund(p) {
+  const reason = h("input", { type: "text", maxlength: "300", placeholder: "e.g. Paid twice by mistake" });
+  const ref = h("input", { type: "text", maxlength: "100", placeholder: "Refund reference from Pesapal / AzamPay (optional)" });
+  const error = h("p", { class: "error", hidden: true });
+  const go = h("button", { class: "btn danger solid", type: "button" }, `Record refund of ${tzs(p.amount)}`);
+  go.addEventListener("click", async () => {
+    error.hidden = true;
+    if (reason.value.trim().length < 3) { error.textContent = "Give a reason (at least 3 letters)."; error.hidden = false; return; }
+    go.disabled = true;
+    go.replaceChildren(h("span", { class: "spinner" }), "Recording…");
+    try {
+      const r = await rpc("admin_refund_payment", { p_order: p.id, p_reason: reason.value.trim(), p_provider_reference: ref.value.trim() || null });
+      toast(num(r?.credits_removed) ? `Refund recorded. ${count(r.credits_removed)} unused credits removed.` : "Refund recorded.");
+      route();
+    } catch (err) {
+      error.textContent = `Couldn't record the refund. ${errorText(err)}`;
+      error.hidden = false;
+      go.disabled = false;
+      go.replaceChildren(`Record refund of ${tzs(p.amount)}`);
+    }
+  });
+  openModal(
+    h("h2", { style: { marginTop: "0" } }, "Refund this payment?"),
+    h("div", { class: "note" },
+      "First send the money back in the Pesapal or AzamPay portal — this page doesn't move money. " +
+      "Recording it here ends the package now (vehicles on it stop showing), removes credits that weren't used, " +
+      "and cancels the partner's commission. It can't be undone."),
+    h("dl", { class: "kv" },
+      h("dt", {}, "Customer"), h("dd", {}, p.customer?.full_name || "—"),
+      h("dt", {}, "Bought"), h("dd", {}, packageName(p.package_id)),
+      h("dt", {}, "Receipt"), h("dd", {}, p.receipt_number || p.merchant_reference || "—")),
+    h("div", { class: "form", style: { marginTop: "16px" } },
+      h("label", {}, "Reason", reason),
+      h("label", {}, "Refund reference", ref),
+      error),
+    h("div", { class: "modal-actions" },
+      h("button", { class: "btn", type: "button", onclick: () => openPayment(p) }, "Back"),
+      go));
 }
 
 // ── Customers ─────────────────────────────────────────────────────────────
@@ -540,12 +628,17 @@ async function renderCustomer(root, id) {
   const body = h("div", {}, loading());
   root.append(body);
   const q = enc(id);
-  const [profile, phones, subs, payments] = await Promise.allSettled([
+  const [profile, phones, subs, payments, credits, referral, partner] = await Promise.allSettled([
     rest(`profiles?id=eq.${q}&select=*`),
     rest(`user_phones?user_id=eq.${q}&select=phone,position,locked_until&order=position`),
     rest(`package_subscriptions?provider_id=eq.${q}&select=*&order=created_at.desc`),
     rest(`payment_orders?provider_id=eq.${q}&select=${PAYMENT_SELECT}&order=created_at.desc`),
+    rest(`contact_credits?user_id=eq.${q}&select=balance`),
+    rest(`referrals?referred_id=eq.${q}&select=code,status,created_at,partner:profiles!referrals_partner_id_fkey(id,full_name)`),
+    rest(`partners?user_id=eq.${q}&select=code,status`),
   ]);
+  const value = (r) => (r.status === "fulfilled" && r.value && r.value[0]) || null;
+  const creditRow = value(credits), refRow = value(referral), partnerRow = value(partner);
   if (profile.status === "rejected") { body.replaceChildren(loadError(profile.reason, () => route())); return; }
   const c = profile.value && profile.value[0];
   if (!c) { body.replaceChildren(h("div", { class: "empty" }, "Customer not found.")); return; }
@@ -584,6 +677,14 @@ async function renderCustomer(root, id) {
         h("dt", {}, "Role"), h("dd", {}, roleLabel(c.role)),
         h("dt", {}, "Language"), h("dd", {}, c.default_language === "sw" ? "Swahili" : "English"),
         h("dt", {}, "Joined"), h("dd", {}, fmtDate(c.created_at)),
+        h("dt", {}, "Credits"), h("dd", {}, count(creditRow?.balance || 0)),
+        h("dt", {}, "Joined with code"), h("dd", {}, refRow
+          ? [refRow.code, " · ", refRow.partner ? h("a", { href: `#partners/${enc(refRow.partner.id)}` }, refRow.partner.full_name || "partner") : "partner deleted",
+             refRow.status === "void" ? [" ", h("span", { class: "badge grey" }, "Void")] : null]
+          : "—"),
+        h("dt", {}, "Partner"), h("dd", {}, partnerRow
+          ? [h("a", { href: `#partners/${enc(c.id)}` }, partnerRow.code), " ", partnerStatusBadge(partnerRow.status)]
+          : "No"),
         h("dt", {}, "User ID"), h("dd", { class: "small" }, c.id)),
       h("div", { class: "modal-actions" },
         h("button", { class: "btn primary", type: "button", onclick: () => openOfferForm(null, [c]) }, "Give an offer"))),
@@ -609,7 +710,16 @@ async function renderPackages(root) {
     grid.replaceChildren(loadError(err, () => route()));
     return;
   }
-  grid.replaceChildren(...rows.map(packageEditor));
+  const groups = [
+    ["Subscriptions (unlimited connections)", rows.filter((r) => r.kind === "package" && r.contact_allowance == null)],
+    ["Pay-as-you-go bundles (credits never expire)", rows.filter((r) => r.kind === "bundle")],
+    ["Packages with a customer-number limit", rows.filter((r) => r.kind === "package" && r.contact_allowance != null)],
+    ["Top-ups", rows.filter((r) => r.kind === "topup")],
+  ].filter(([, list]) => list.length);
+  grid.replaceWith(h("div", {}, groups.map(([title, list]) => [
+    h("h2", {}, title),
+    h("div", { class: "packages" }, list.map(packageEditor)),
+  ])));
 }
 
 function packageEditor(pkg) {
@@ -618,13 +728,16 @@ function packageEditor(pkg) {
     const input = h("input", { type: "number", inputmode: "numeric", value: String(value), ...attrs });
     return [input, h("label", {}, label, input)];
   };
-  const [price, priceLabel] = field("Price (TZS)", pkg.amount, { min: "500", step: "500" });
+  const [price, priceLabel] = field("Price (TZS)", pkg.amount, { min: "100", step: "100" });
   const [listings, listingsLabel] = field("Listings allowed", pkg.listing_allowance, { min: "1", max: "500" });
   const [days, daysLabel] = field("Duration (days)", pkg.validity_days, { min: "1", max: "730" });
-  const [contacts, contactsLabel] = field("Customer numbers", pkg.contact_allowance ?? "", { min: "1", max: "5000" });
-  // A top-up adds customer numbers to a running package: no listings, and it
-  // ends with that package.
-  const topUp = pkg.kind === "topup";
+  // A bundle sells connection credits (they never expire). A top-up adds
+  // customer numbers to a running package. Neither gives listings or a
+  // duration of its own.
+  const bundle = pkg.kind === "bundle";
+  const [contacts, contactsLabel] = field(bundle ? "Credits" : "Customer numbers", pkg.contact_allowance ?? "",
+    { min: "1", max: "5000", placeholder: bundle ? "" : "Unlimited" });
+  const topUp = pkg.kind === "topup" || bundle;
   priceLabel.classList.add("full");
   const active = h("input", { type: "checkbox" });
   active.checked = pkg.active !== false;
@@ -659,10 +772,10 @@ function packageEditor(pkg) {
 
   saveBtn.addEventListener("click", async () => {
     const v = values();
-    if (!Number.isInteger(v.amount) || v.amount < 500) { toast("Price must be a whole number of at least TZS 500.", true); return; }
+    if (!Number.isInteger(v.amount) || v.amount < 100) { toast("Price must be a whole number of at least TZS 100.", true); return; }
     if (!topUp && (!Number.isInteger(v.listing_allowance) || v.listing_allowance < 1 || v.listing_allowance > 500)) { toast("Listings must be between 1 and 500.", true); return; }
     if (!topUp && (!Number.isInteger(v.validity_days) || v.validity_days < 1 || v.validity_days > 730)) { toast("Duration must be between 1 and 730 days.", true); return; }
-    if ("contact_allowance" in v && (!Number.isInteger(v.contact_allowance) || v.contact_allowance < 1 || v.contact_allowance > 5000)) { toast("Customer numbers must be between 1 and 5000.", true); return; }
+    if ("contact_allowance" in v && (!Number.isInteger(v.contact_allowance) || v.contact_allowance < 1 || v.contact_allowance > 5000)) { toast(`${bundle ? "Credits" : "Customer numbers"} must be between 1 and 5000.`, true); return; }
     if (!v.active && saved.active !== false) {
       const ok = await confirmDialog({
         title: `Stop selling ${packageName(pkg.id)}?`,
@@ -689,9 +802,13 @@ function packageEditor(pkg) {
     }
   });
 
+  const kindBadge = bundle ? h("span", { class: "badge blue" }, "Credits")
+    : pkg.kind === "topup" ? h("span", { class: "badge grey" }, "Top-up")
+    : pkg.contact_allowance == null ? h("span", { class: "badge orange" }, "Unlimited")
+    : h("span", { class: "badge grey" }, "Limited");
   return h("div", { class: "card" },
     h("div", { class: "pkg-head" },
-      h("h3", {}, packageName(pkg.id)),
+      h("div", { class: "pkg-title" }, h("h3", {}, packageName(pkg.id)), kindBadge),
       h("label", { class: "switch" }, onSale, active)),
     h("div", { class: "pkg-fields" }, priceLabel, ...(topUp ? [] : [listingsLabel, daysLabel]), contactsLabel),
     h("div", { class: "pkg-foot" }, updated, saveBtn));
@@ -726,9 +843,9 @@ function offerState(o) {
   return ["Live", "ok"];
 }
 
-/// Same rounding as the database: nearest TZS 100, never below TZS 500.
+/// Same rounding as the database: nearest TZS 100, never below TZS 100.
 function offerPrice(amount, percentOff) {
-  return Math.max(500, Math.round((amount * (100 - percentOff)) / 10000) * 100);
+  return Math.max(100, Math.round((amount * (100 - percentOff)) / 10000) * 100);
 }
 
 async function renderOffers(root) {
@@ -737,7 +854,7 @@ async function renderOffers(root) {
       h("button", { class: "btn primary", type: "button", onclick: () => openOfferForm(null, []) }, "New offer")),
     h("p", { class: "muted small" },
       "Buyers automatically get the best live offer that applies to them, in the app and on the website. " +
-      "Prices are rounded to the nearest TZS 100 and never go below TZS 500."));
+      "Prices are rounded to the nearest TZS 100 and never go below TZS 100."));
   const list = h("div", {}, loading());
   root.append(list);
   let offers;
@@ -1103,6 +1220,581 @@ function renderPosts(root) {
     }
   }
   load();
+}
+
+// ── Business (the business plan's numbers) ────────────────────────────────
+
+const businessState = { days: 30 };
+
+function partnerStatusBadge(status) {
+  return status === "suspended"
+    ? h("span", { class: "badge bad" }, "Suspended")
+    : h("span", { class: "badge ok" }, "Active");
+}
+
+function migrationMissing(err) {
+  return err && (err.status === 404 || /could not find|does not exist/i.test(err.message || ""));
+}
+
+function planNotLive() {
+  return h("div", { class: "card" },
+    h("h2", { style: { marginTop: "0" } }, "The business-plan update isn't in the database yet"),
+    h("p", { class: "muted" },
+      "Apply migration 20261122090000_business_plan (supabase db push) to switch on subscriptions, " +
+      "credit bundles, partners, payouts and these reports."));
+}
+
+async function renderBusiness(root) {
+  const periods = [[7, "7 days"], [30, "30 days"], [90, "90 days"], [365, "12 months"]];
+  root.append(h("div", { class: "toolbar" }, h("div", { class: "chips" }, periods.map(([d, label]) => h("button", {
+    type: "button", class: `chip ${businessState.days === d ? "on" : ""}`,
+    onclick: () => { businessState.days = d; route(); },
+  }, label)))));
+  const body = h("div", {}, loading());
+  root.append(body);
+  let b;
+  try {
+    b = (await rpc("admin_business_report", { p_days: businessState.days })) || {};
+  } catch (err) {
+    body.replaceChildren(migrationMissing(err) ? planNotLive() : loadError(err, () => route()));
+    return;
+  }
+  const r = b.revenue || {}, c = b.commissions || {}, u = b.users || {}, w = b.watch || {};
+  const retention = num(r.net) - num(c.earned);
+  const conn = b.connections || {}, paidBy = conn.paid_by || {};
+
+  const mix = [
+    ["Subscriptions", r.subscriptions], ["Credit bundles", r.bundles],
+    ["Limited packages", r.packages], ["Top-ups", r.topups],
+  ].map(([label, amount]) => ({ label, amount: num(amount) }));
+
+  const connRows = [
+    ["Unlimited package", paidBy.unlimited], ["Package with a limit", paidBy.package],
+    ["Credit", paidBy.credit], ["Free: opened before", paidBy.repeat],
+    ["Free: replying to someone", paidBy.connection], ["Before the plan", paidBy.before_plan],
+  ].filter(([, n]) => num(n) > 0).map(([label, n]) => ({ label, amount: num(n) }));
+
+  const watchItems = [
+    [num(w.shared_phone_referrals), "referrals share a phone number with their partner (same person?)", "#partners"],
+    [num(w.refunds_period), `refund${num(w.refunds_period) === 1 ? "" : "s"} in this period`, "#payments"],
+    [num(w.fair_use_hits), "people near the daily fair-use limit right now", null],
+    [(w.busy_payers || []).length, "payer accounts paying for 3+ referred people", null],
+  ].filter(([n]) => n > 0);
+
+  body.replaceChildren(h("div", {},
+    h("p", { class: "muted small" }, `Real payments only (test payments left out). Last ${businessState.days === 365 ? "12 months" : `${businessState.days} days`}, Tanzania time.`),
+    h("div", { class: "stats" },
+      stat("Revenue (after refunds)", tzs(r.net), "money"),
+      stat("Partner commissions", tzs(c.earned), "money"),
+      stat("Kept by TeleTransit", tzs(retention), "money"),
+      stat("Refunded", tzs(r.refunded), num(r.refunded) ? "bad" : ""),
+      stat("Paid orders", count(r.orders))),
+    h("p", { class: "muted small" }, "“Kept by TeleTransit” is revenue minus partner commissions — before hosting, payment charges, taxes and other costs."),
+
+    h("h2", {}, "Every day"),
+    h("div", { class: "grid2" },
+      barChart("Revenue per day", b.daily || [], "revenue", tzs),
+      barChart("Partner commission per day", b.daily || [], "commission", tzs)),
+
+    h("div", { class: "grid2", style: { marginTop: "14px" } },
+      h("div", {}, h("h2", {}, "Where revenue comes from"), hbars(mix, tzs, "No revenue in this period yet.")),
+      h("div", {}, h("h2", {}, "How numbers were opened"), hbars(connRows, count, "No numbers opened in this period."))),
+
+    h("h2", {}, "People"),
+    h("div", { class: "stats" },
+      stat("Paying customers (all time)", count(u.paying)),
+      stat("Bought more than once", count(u.repeat)),
+      stat("New sign-ups", count(u.new)),
+      stat("On an unlimited package now", count(u.active_unlimited)),
+      stat("Holding credits", count(u.credit_holders)),
+      stat("Credits not yet used", count(u.credits_outstanding))),
+
+    h("h2", {}, "Partners"),
+    h("div", { class: "stats" },
+      linkStat("Active partners", count(u.partners), "#partners"),
+      stat("New partners", count(u.partners_new)),
+      stat("Referred users", count(u.referred)),
+      stat("Referred in this period", count(u.referred_new)),
+      linkStat("Owed to partners now", tzs(c.owed), "#partners", "money"),
+      linkStat("Payouts waiting", `${count(c.waiting_count)} · ${tzs(c.waiting_payout)}`, "#payouts", num(c.waiting_count) ? "warn" : ""),
+      stat("Paid out in this period", tzs(c.paid_out), "money")),
+
+    h("h2", {}, "Watch list"),
+    watchItems.length
+      ? h("div", { class: "card" }, watchItems.map(([n, text, href]) => h("div", { class: "list-row" },
+          h("span", {}, h("b", {}, count(n)), " ", text),
+          href ? h("a", { href }, "Look") : h("span", {}))),
+          (w.busy_payers || []).map((x) => h("div", { class: "list-row small" },
+            h("span", { class: "muted" }, `Payer account …${x.payer_account}`),
+            h("span", {}, `${count(x.people)} people · ${count(x.orders)} orders`))))
+      : h("div", { class: "card muted" }, "Nothing unusual right now."),
+
+    (b.refunds || []).length ? [
+      h("h2", {}, "Latest refunds"),
+      h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, h("th", {}, "Date"), h("th", {}, "Customer"), h("th", {}, "Bought"), h("th", { class: "num" }, "Amount"), h("th", {}, "Reason"))),
+        h("tbody", {}, b.refunds.map((f) => h("tr", {},
+          h("td", {}, fmtDate(f.created_at)),
+          h("td", {}, f.full_name || "—"),
+          h("td", {}, packageName(f.package_id), h("div", { class: "sub" }, f.receipt_number || "")),
+          h("td", { class: "num" }, tzs(f.amount)),
+          h("td", {}, f.reason)))))),
+    ] : null,
+  ));
+}
+
+/// Horizontal bars for one measure across a few labelled categories.
+function hbars(rows, format, emptyText) {
+  const total = rows.reduce((a, r) => a + r.amount, 0);
+  if (!total) return h("div", { class: "card muted" }, emptyText);
+  const max = Math.max(...rows.map((r) => r.amount));
+  return h("div", { class: "card" }, rows.map((r) => h("div", { class: "hbar", title: `${r.label}: ${format(r.amount)}` },
+    h("div", { class: "hbar-row" },
+      h("span", {}, r.label),
+      h("span", { class: "muted" }, `${format(r.amount)} · ${Math.round((r.amount / total) * 100)}%`)),
+    h("div", { class: "hbar-track" }, h("div", { class: "hbar-fill", style: { width: `${(r.amount / max) * 100}%` } })))));
+}
+
+// ── Partners ──────────────────────────────────────────────────────────────
+
+const partnersState = { search: "" };
+
+async function renderPartners(root, id) {
+  if (id) { renderPartner(root, id); return; }
+  const search = h("input", { type: "search", value: partnersState.search, placeholder: "Search name, email, phone or code" });
+  const list = h("div", {}, loading());
+  root.append(
+    h("div", { class: "toolbar" }, search),
+    h("p", { class: "muted small" },
+      "Partners earn a share of what the people who joined with their code pay. Earnings wait for the refund window, then can be withdrawn."),
+    list);
+  let rows;
+  try {
+    rows = (await rpc("admin_partners")) || [];
+  } catch (err) {
+    list.replaceChildren(migrationMissing(err) ? planNotLive() : loadError(err, () => route()));
+    return;
+  }
+  function draw() {
+    const q = partnersState.search.trim().toLowerCase();
+    const shown = !q ? rows : rows.filter((p) => [p.full_name, p.email, p.phone, p.code]
+      .some((v) => v && String(v).toLowerCase().includes(q)));
+    if (!shown.length) { list.replaceChildren(h("div", { class: "table-wrap" }, h("div", { class: "empty" }, rows.length ? "No partner matches." : "No partners yet. People join from the app (Profile → Business partner)."))); return; }
+    const totals = shown.reduce((t, p) => ({
+      earned: t.earned + num(p.earned_total), available: t.available + Math.max(0, num(p.available)),
+      pending: t.pending + num(p.pending), paid: t.paid + num(p.paid_out),
+    }), { earned: 0, available: 0, pending: 0, paid: 0 });
+    list.replaceChildren(
+      h("div", { class: "stats", style: { marginBottom: "14px" } },
+        stat("Partners", count(shown.length)),
+        stat("Earned", tzs(totals.earned), "money"),
+        stat("In refund window", tzs(totals.pending)),
+        stat("Can be withdrawn", tzs(totals.available), "money"),
+        stat("Paid out", tzs(totals.paid))),
+      h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {},
+          h("th", {}, "Partner"), h("th", {}, "Code"), h("th", { class: "num" }, "Referred"), h("th", { class: "num" }, "Paying"),
+          h("th", { class: "num" }, "Earned"), h("th", { class: "num" }, "Available"), h("th", { class: "num" }, "Paid out"), h("th", {}, "Status"))),
+        h("tbody", {}, shown.map((p) => h("tr", { class: "click", onclick: () => { location.hash = `partners/${enc(p.user_id)}`; } },
+          h("td", {}, p.full_name || "—", h("div", { class: "sub" }, p.phone || p.email || "")),
+          h("td", {}, h("code", {}, p.code)),
+          h("td", { class: "num" }, count(p.referrals)),
+          h("td", { class: "num" }, count(p.paying)),
+          h("td", { class: "num" }, tzs(p.earned_total), num(p.reversed) ? h("div", { class: "sub" }, `${count(p.reversed)} reversed`) : null),
+          h("td", { class: "num" }, h("span", { class: num(p.available) < 0 ? "neg" : "" }, tzs(p.available)),
+            num(p.pending) ? h("div", { class: "sub" }, `+${tzs(p.pending)} waiting`) : null),
+          h("td", { class: "num" }, tzs(p.paid_out)),
+          h("td", {}, partnerStatusBadge(p.status))))))));
+  }
+  search.addEventListener("input", () => { partnersState.search = search.value; draw(); });
+  draw();
+}
+
+async function renderPartner(root, id) {
+  root.append(h("a", { class: "back", href: "#partners" }, "← All partners"));
+  const body = h("div", {}, loading());
+  root.append(body);
+  let d;
+  try {
+    d = await rpc("admin_partner_detail", { p_partner: id });
+  } catch (err) {
+    body.replaceChildren(loadError(err, () => route()));
+    return;
+  }
+  const p = d && d.partner;
+  if (!p) { body.replaceChildren(h("div", { class: "empty" }, "This person isn't a partner.")); return; }
+  const bal = p.balance || {};
+  const suspended = p.status === "suspended";
+
+  const toggle = h("button", { class: `btn ${suspended ? "primary" : "danger"}`, type: "button" }, suspended ? "Reactivate" : "Suspend partner");
+  toggle.addEventListener("click", async () => {
+    let reason = null;
+    if (!suspended) {
+      reason = await promptDialog({
+        title: `Suspend ${p.full_name || "this partner"}?`,
+        body: "While suspended they earn nothing new and can't withdraw. What they already earned stays on record. You can reactivate them later.",
+        label: "Reason (shown to admins only)", confirmLabel: "Suspend", danger: true,
+      });
+      if (reason == null) return;
+    }
+    try {
+      await rpc("admin_set_partner_status", { p_partner: id, p_status: suspended ? "active" : "suspended", p_reason: reason });
+      toast(suspended ? "Partner reactivated." : "Partner suspended.");
+      route();
+    } catch (err) { toast(`Couldn't update. ${errorText(err)}`, true); }
+  });
+
+  async function voidReferral(r) {
+    const reason = await promptDialog({
+      title: `Stop ${r.full_name || "this person"} earning for the partner?`,
+      body: "The referral is voided: future purchases earn nothing. Commissions from them that weren't paid out yet are reversed too.",
+      label: "Reason", confirmLabel: "Void referral", danger: true,
+    });
+    if (reason == null) return;
+    try {
+      await rpc("admin_void_referral", { p_referred: r.referred_id, p_reason: reason, p_reverse: true });
+      toast("Referral voided.");
+      route();
+    } catch (err) { toast(`Couldn't void. ${errorText(err)}`, true); }
+  }
+
+  async function reverse(c) {
+    const reason = await promptDialog({
+      title: `Reverse ${tzs(c.amount)}?`,
+      body: "The partner won't be paid this commission. If it was already paid out, it comes off their next earnings.",
+      label: "Reason", confirmLabel: "Reverse", danger: true,
+    });
+    if (reason == null) return;
+    try {
+      await rpc("admin_reverse_commission", { p_id: c.id, p_reason: reason });
+      toast("Commission reversed.");
+      route();
+    } catch (err) { toast(`Couldn't reverse. ${errorText(err)}`, true); }
+  }
+
+  const now = Date.now();
+  const referrals = d.referrals || [], commissions = d.commissions || [], withdrawals = d.withdrawals || [];
+  body.replaceChildren(
+    h("div", { class: "card" },
+      h("div", { class: "detail-head" },
+        h("div", {}, h("h2", {}, p.full_name || "—"), h("div", { class: "muted" }, "Code ", h("code", {}, p.code))),
+        partnerStatusBadge(p.status)),
+      h("dl", { class: "kv" },
+        h("dt", {}, "Email"), h("dd", {}, p.email || "—"),
+        h("dt", {}, "Phone"), h("dd", {}, p.phone || "—"),
+        h("dt", {}, "Partner since"), h("dd", {}, fmtDate(p.created_at)),
+        suspended ? [h("dt", {}, "Suspended because"), h("dd", {}, p.status_reason || "—")] : null),
+      h("div", { class: "modal-actions" },
+        h("a", { class: "btn", href: `#customers/${enc(id)}` }, "Customer page"), toggle)),
+    h("div", { class: "stats", style: { marginTop: "14px" } },
+      stat("Can be withdrawn", tzs(bal.available), num(bal.available) < 0 ? "bad" : "money"),
+      stat("In refund window", tzs(bal.pending)),
+      stat("Earned (all time)", tzs(bal.earned_total), "money"),
+      stat("Being paid out", tzs(bal.in_progress), num(bal.in_progress) ? "warn" : ""),
+      stat("Paid out", tzs(bal.paid_out))),
+
+    h("h2", {}, `People who joined with ${p.code}`),
+    !referrals.length ? h("div", { class: "table-wrap" }, h("div", { class: "empty" }, "No one yet.")) :
+    h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, h("th", {}, "Person"), h("th", {}, "Joined"), h("th", { class: "num" }, "Spent"), h("th", {}, "Status"), h("th", {}, ""))),
+      h("tbody", {}, referrals.map((r) => h("tr", {},
+        h("td", {}, h("a", { href: `#customers/${enc(r.referred_id)}` }, r.full_name || "—"),
+          h("div", { class: "sub" }, r.phone || r.email || ""),
+          r.shared_phone ? h("div", {}, h("span", { class: "badge warn" }, "Shares a phone number")) : null),
+        h("td", {}, fmtDate(r.created_at), h("div", { class: "sub" }, r.source === "signup" ? "at sign-up" : "code entered later")),
+        h("td", { class: "num" }, tzs(r.spent)),
+        h("td", {}, r.status === "void" ? h("span", { class: "badge grey", title: r.void_reason || "" }, "Void") : h("span", { class: "badge ok" }, "Counts")),
+        h("td", { class: "num" }, r.status === "void" ? null : h("button", { class: "btn small danger", type: "button", onclick: () => voidReferral(r) }, "Void"))))))),
+
+    h("h2", {}, "Commissions"),
+    !commissions.length ? h("div", { class: "table-wrap" }, h("div", { class: "empty" }, "No commissions yet.")) :
+    h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, h("th", {}, "Date"), h("th", {}, "From"), h("th", {}, "Bought"), h("th", { class: "num" }, "Paid"), h("th", { class: "num" }, "Commission"), h("th", {}, "Status"), h("th", {}, ""))),
+      h("tbody", {}, commissions.map((c) => {
+        const reversed = c.status === "reversed";
+        const waiting = !reversed && new Date(c.available_at).getTime() > now;
+        return h("tr", {},
+          h("td", {}, fmtDate(c.created_at)),
+          h("td", {}, c.referred_name || "—"),
+          h("td", {}, packageName(c.package_id), h("div", { class: "sub" }, c.receipt_number || "")),
+          h("td", { class: "num" }, tzs(c.order_amount)),
+          h("td", { class: "num" }, tzs(c.amount), h("div", { class: "sub" }, `${num(c.rate_bp) / 100}%`)),
+          h("td", {}, reversed ? h("span", { class: "badge grey", title: c.reversed_reason || "" }, "Reversed")
+            : waiting ? h("span", { class: "badge warn" }, `Until ${fmtDate(c.available_at, false)}`)
+            : h("span", { class: "badge ok" }, "Available")),
+          h("td", { class: "num" }, reversed ? null : h("button", { class: "btn small danger", type: "button", onclick: () => reverse(c) }, "Reverse")));
+      })))),
+
+    h("h2", {}, "Withdrawals"),
+    withdrawalsTable(withdrawals, false),
+  );
+}
+
+/// A small form dialog: resolves to the trimmed text, or null if cancelled.
+function promptDialog({ title, body, label, confirmLabel, danger, placeholder, required = true }) {
+  return new Promise((resolve) => {
+    const input = h("input", { type: "text", maxlength: "300", placeholder: placeholder || "" });
+    const error = h("p", { class: "error", hidden: true });
+    const done = (v) => { closeModal(); resolve(v); };
+    const ok = () => {
+      const v = input.value.trim();
+      if (required && v.length < 3) { error.textContent = "Please write at least a few words."; error.hidden = false; return; }
+      done(v);
+    };
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); ok(); } });
+    openModal(
+      h("h2", { style: { marginTop: "0" } }, title),
+      h("p", { class: "muted" }, body),
+      h("div", { class: "form" }, h("label", {}, label, input), error),
+      h("div", { class: "modal-actions" },
+        h("button", { class: "btn", type: "button", onclick: () => done(null) }, "Cancel"),
+        h("button", { class: `btn ${danger ? "danger solid" : "primary"}`, type: "button", onclick: ok }, confirmLabel)));
+    setTimeout(() => input.focus(), 0);
+  });
+}
+
+// ── Payouts ───────────────────────────────────────────────────────────────
+
+const payoutsState = { status: "requested" };
+
+function withdrawalBadge(status) {
+  const map = {
+    requested: ["Waiting for you", "warn"], processing: ["Sending", "blue"], paid: ["Paid", "ok"],
+    failed: ["Didn't go through", "bad"], rejected: ["Rejected", "bad"], cancelled: ["Cancelled by partner", "grey"],
+  };
+  const [label, tone] = map[status] || [status, "grey"];
+  return h("span", { class: `badge ${tone}` }, label);
+}
+
+const NETWORKS = { Mpesa: "M-Pesa", Tigo: "Mixx by Yas", Airtel: "Airtel Money", Halopesa: "Halopesa", Azampesa: "AzamPesa" };
+
+function withdrawalsTable(rows, withPartner, onOpen) {
+  if (!rows.length) return h("div", { class: "table-wrap" }, h("div", { class: "empty" }, "No withdrawals here."));
+  return h("div", { class: "table-wrap" }, h("table", {},
+    h("thead", {}, h("tr", {},
+      h("th", {}, "Requested"), withPartner && h("th", {}, "Partner"), h("th", {}, "Send to"),
+      h("th", { class: "num" }, "Amount"), h("th", {}, "Status"), h("th", {}, "Reference"))),
+    h("tbody", {}, rows.map((w) => h("tr", { class: onOpen ? "click" : "", onclick: onOpen ? () => onOpen(w) : null },
+      h("td", {}, fmtDate(w.requested_at)),
+      withPartner && h("td", {}, w.full_name || "—", h("div", { class: "sub" }, w.code || "")),
+      h("td", {}, `+${w.phone}`, h("div", { class: "sub" }, NETWORKS[w.network] || w.network)),
+      h("td", { class: "num" }, tzs(w.amount)),
+      h("td", {}, withdrawalBadge(w.status), w.provider_message ? h("div", { class: "sub" }, w.provider_message) : null),
+      h("td", {}, h("code", {}, w.reference), w.provider_reference ? h("div", { class: "sub" }, w.provider_reference) : null))))));
+}
+
+async function renderPayouts(root) {
+  const filters = [["requested", "Waiting for you"], ["processing", "Sending"], ["paid", "Paid"], ["failed", "Didn't go through"], ["rejected", "Rejected"], [null, "All"]];
+  const setup = h("div", {});
+  const list = h("div", {}, loading());
+  root.append(
+    setup,
+    h("div", { class: "toolbar" }, h("div", { class: "chips" }, filters.map(([v, label]) => h("button", {
+      type: "button", class: `chip ${payoutsState.status === v ? "on" : ""}`,
+      onclick: () => { payoutsState.status = v; route(); },
+    }, label)))),
+    list);
+
+  edgeGet("partner-payout")
+    .then((s) => {
+      setup.replaceChildren(s && s.configured
+        ? h("div", { class: "note ok" }, "AzamPay payouts are set up: “Send with AzamPay” sends the money to the partner's phone.")
+        : h("div", { class: "note" },
+            "AzamPay payouts aren't set up yet, so “Send with AzamPay” won't work. You can still pay partners yourself and record it with “Mark as paid”. ",
+            s && s.missing && s.missing.length ? h("span", { class: "small" }, `Missing: ${s.missing.join(", ")}.`) : null));
+    })
+    .catch(() => setup.replaceChildren(h("div", { class: "note" },
+      "Couldn't check the AzamPay payout setup (the partner-payout function may not be deployed yet). “Mark as paid” still works.")));
+
+  let rows;
+  try {
+    rows = (await rpc("admin_withdrawals", { p_status: payoutsState.status })) || [];
+  } catch (err) {
+    list.replaceChildren(migrationMissing(err) ? planNotLive() : loadError(err, () => route()));
+    return;
+  }
+  const total = rows.reduce((t, w) => t + num(w.amount), 0);
+  list.replaceChildren(
+    h("p", { class: "muted small" }, `${rows.length} withdrawal${rows.length === 1 ? "" : "s"} · ${tzs(total)}`),
+    withdrawalsTable(rows, true, openWithdrawal));
+}
+
+function openWithdrawal(w) {
+  const busy = (btn, text) => { btn.disabled = true; btn.replaceChildren(h("span", { class: "spinner" }), text); };
+  const actions = [];
+
+  if (w.status === "requested") {
+    const send = h("button", { class: "btn primary", type: "button" }, "Send with AzamPay");
+    send.addEventListener("click", async () => {
+      const ok = await confirmDialog({
+        title: `Send ${tzs(w.amount)} to +${w.phone}?`,
+        body: `AzamPay sends it to ${NETWORKS[w.network] || w.network} for ${w.full_name || "the partner"}. This can't be undone.`,
+        confirmLabel: "Send money",
+      });
+      if (!ok) { openWithdrawal(w); return; }
+      openModal(loading());
+      try {
+        const r = await edgeFunction("partner-payout", { withdrawalId: w.id, action: "send" });
+        toast(r.status === "failed" ? `AzamPay refused it: ${r.message}` : "Sent to AzamPay. It's marked paid once AzamPay confirms.", r.status === "failed");
+      } catch (err) {
+        toast(err.message && err.message !== "server" ? err.message : errorText(err), true);
+      }
+      route();
+    });
+    actions.push(send);
+  }
+  if (w.status === "processing") {
+    const check = h("button", { class: "btn primary", type: "button" }, "Check status with AzamPay");
+    check.addEventListener("click", async () => {
+      busy(check, "Checking…");
+      try {
+        const r = await edgeFunction("partner-payout", { withdrawalId: w.id, action: "check" });
+        toast(r.status === "paid" ? "Paid." : r.status === "failed" ? "It didn't go through. The money is back in the partner's balance." : `Still sending: ${r.message}`);
+      } catch (err) {
+        toast(err.message && err.message !== "server" ? err.message : errorText(err), true);
+      }
+      route();
+    });
+    actions.push(check);
+  }
+  if (["requested", "processing", "failed"].includes(w.status)) {
+    const paid = h("button", { class: "btn", type: "button" }, "Mark as paid");
+    paid.addEventListener("click", async () => {
+      const ref = await promptDialog({
+        title: `Record ${tzs(w.amount)} as paid`,
+        body: `Only if the money reached +${w.phone}. Enter the mobile-money transaction ID from your phone or the AzamPay portal.`,
+        label: "Transaction ID", placeholder: "e.g. QK41ABC9XY", confirmLabel: "Mark as paid",
+      });
+      if (ref == null) { openWithdrawal(w); return; }
+      try {
+        await rpc("admin_settle_withdrawal", { p_id: w.id, p_action: "paid", p_reference: ref, p_note: null });
+        toast("Recorded as paid.");
+        route();
+      } catch (err) { toast(`Couldn't record it. ${errorText(err)}`, true); }
+    });
+    actions.push(paid);
+  }
+  if (["requested", "processing"].includes(w.status)) {
+    const reject = h("button", { class: "btn danger", type: "button" }, w.status === "requested" ? "Reject" : "Mark as failed");
+    reject.addEventListener("click", async () => {
+      const note = await promptDialog({
+        title: w.status === "requested" ? "Reject this withdrawal?" : "Mark as failed?",
+        body: w.status === "requested"
+          ? "Nothing is sent and the money stays in the partner's balance. The partner sees your reason."
+          : "Only if you're sure the money did NOT arrive. It goes back to the partner's balance.",
+        label: "Reason", confirmLabel: w.status === "requested" ? "Reject" : "Mark as failed", danger: true,
+      });
+      if (note == null) { openWithdrawal(w); return; }
+      try {
+        await rpc("admin_settle_withdrawal", { p_id: w.id, p_action: w.status === "requested" ? "reject" : "failed", p_reference: null, p_note: note });
+        toast("Updated.");
+        route();
+      } catch (err) { toast(`Couldn't update. ${errorText(err)}`, true); }
+    });
+    actions.push(reject);
+  }
+
+  const lowBalance = w.status === "requested" && num(w.balance_after) < 0;
+  openModal(
+    h("div", { class: "detail-head" },
+      h("div", {}, h("h2", {}, tzs(w.amount)), h("div", { class: "muted" }, w.full_name || "—")),
+      withdrawalBadge(w.status)),
+    lowBalance ? h("p", { class: "error" }, "A commission was reversed after this was requested: the partner's balance no longer covers it. Reject it.") : null,
+    w.partner_status === "suspended" ? h("p", { class: "error" }, "This partner is suspended.") : null,
+    h("dl", { class: "kv" },
+      h("dt", {}, "Send to"), h("dd", {}, `+${w.phone} · ${NETWORKS[w.network] || w.network}`),
+      h("dt", {}, "Partner"), h("dd", {}, h("a", { href: `#partners/${enc(w.partner_id)}` }, `${w.full_name || "—"} (${w.code || "—"})`)),
+      h("dt", {}, "Requested"), h("dd", {}, fmtDate(w.requested_at)),
+      h("dt", {}, "Our reference"), h("dd", {}, w.reference),
+      h("dt", {}, "AzamPay reference"), h("dd", {}, w.provider_reference || "—"),
+      h("dt", {}, "Message"), h("dd", {}, w.provider_message || w.admin_note || "—"),
+      h("dt", {}, "Paid"), h("dd", {}, w.paid_at ? `${fmtDate(w.paid_at)}${w.paid_manually ? " (recorded by hand)" : ""}` : "—")),
+    h("div", { class: "modal-actions" }, ...actions, h("button", { class: "btn", type: "button", onclick: closeModal }, "Close")));
+}
+
+// ── Settings ──────────────────────────────────────────────────────────────
+
+async function renderSettings(root) {
+  const body = h("div", {}, loading());
+  root.append(body);
+  let s;
+  try {
+    const rows = await rest("business_settings?select=*");
+    s = rows && rows[0];
+  } catch (err) {
+    body.replaceChildren(migrationMissing(err) ? planNotLive() : loadError(err, () => route()));
+    return;
+  }
+  if (!s) { body.replaceChildren(planNotLive()); return; }
+
+  const field = (label, value, hint, attrs) => {
+    const input = h("input", { type: "number", inputmode: "decimal", value: String(value), ...attrs });
+    return [input, h("label", {}, label, input, h("span", { class: "hint" }, hint))];
+  };
+  const [rate, rateL] = field("Partner commission (%)", num(s.commission_bp) / 100, "Share of each eligible purchase. The plan says 20%.", { min: "0", max: "50", step: "0.5" });
+  const [ded, dedL] = field("Taken off first (%)", num(s.commission_deduction_bp) / 100, "For taxes and payment charges. 0 = the full price counts.", { min: "0", max: "50", step: "0.5" });
+  const [hold, holdL] = field("Refund window (days)", s.commission_hold_days, "Earnings wait this long before they can be withdrawn.", { min: "0", max: "90", step: "1" });
+  const [minW, minL] = field("Smallest withdrawal (TZS)", s.min_withdrawal, "The plan says TZS 10,000.", { min: "1000", step: "1000" });
+  const [fair, fairL] = field("Fair use: new numbers per day", s.fair_use_daily, "Most new people one unlimited package can open in 24 hours.", { min: "5", max: "1000", step: "1" });
+  const signupsOpen = h("input", { type: "checkbox" });
+  signupsOpen.checked = s.partner_signups_open !== false;
+  const signupsLabel = h("div", { class: "form" },
+    h("label", { class: "switch" }, signupsOpen, "Accept new partners"),
+    h("span", { class: "hint" }, "Turn off to pause new people joining the partner programme. Existing partners keep earning, withdrawing and referring."));
+  const example = h("div", { class: "card offer-preview" });
+  const drawExample = () => {
+    const r = Number(rate.value) * 100, d = Number(ded.value) * 100;
+    const on = (amount) => Math.floor((amount * (10000 - d)) / 10000 * r / 10000);
+    example.replaceChildren(h("div", { class: "chart-title" }, "What a partner earns"),
+      ...[["Daily", 500], ["Monthly", 2500], ["Annual", 10000], ["Premium bundle", 4000]].map(([name, amount]) => h("div", { class: "list-row" },
+        h("span", {}, `${name} (${tzs(amount)})`), h("b", {}, Number.isFinite(on(amount)) ? tzs(on(amount)) : "—"))));
+  };
+  [rate, ded].forEach((i) => i.addEventListener("input", drawExample));
+  drawExample();
+
+  const error = h("p", { class: "error", hidden: true });
+  const save = h("button", { class: "btn primary", type: "button" }, "Save settings");
+  save.addEventListener("click", async () => {
+    error.hidden = true;
+    const v = {
+      commission_bp: Math.round(Number(rate.value) * 100),
+      commission_deduction_bp: Math.round(Number(ded.value) * 100),
+      commission_hold_days: Number(hold.value),
+      min_withdrawal: Number(minW.value),
+      fair_use_daily: Number(fair.value),
+      partner_signups_open: signupsOpen.checked,
+    };
+    const bad = (!(v.commission_bp >= 0 && v.commission_bp <= 5000) && "Commission must be between 0% and 50%.")
+      || (!(v.commission_deduction_bp >= 0 && v.commission_deduction_bp <= 5000) && "“Taken off first” must be between 0% and 50%.")
+      || (!(Number.isInteger(v.commission_hold_days) && v.commission_hold_days >= 0 && v.commission_hold_days <= 90) && "The refund window must be 0 to 90 days.")
+      || (!(Number.isInteger(v.min_withdrawal) && v.min_withdrawal >= 1000) && "The smallest withdrawal must be at least TZS 1,000.")
+      || (!(Number.isInteger(v.fair_use_daily) && v.fair_use_daily >= 5 && v.fair_use_daily <= 1000) && "Fair use must be 5 to 1000.");
+    if (bad) { error.textContent = bad; error.hidden = false; return; }
+    save.disabled = true;
+    save.replaceChildren(h("span", { class: "spinner" }), "Saving…");
+    try {
+      const rows = await rest("business_settings?id=eq.true", { method: "PATCH", body: v, prefer: "return=representation" });
+      if (!rows || !rows[0]) throw new ApiError("forbidden", 403, "Not allowed to change settings");
+      toast("Settings saved. New purchases use them from now on.");
+      route();
+    } catch (err) {
+      error.textContent = `Couldn't save. ${errorText(err)}`;
+      error.hidden = false;
+      save.disabled = false;
+      save.replaceChildren("Save settings");
+    }
+  });
+
+  body.replaceChildren(
+    h("div", { class: "note" }, "Changes apply to purchases made from now on. Commissions already earned keep the rate they were earned at."),
+    h("div", { class: "grid2" },
+      h("div", { class: "card" }, h("h3", { class: "card-title" }, "Partner programme"),
+        h("div", { class: "form" }, rateL, dedL, holdL, minL), signupsLabel),
+      h("div", {},
+        h("div", { class: "card" }, h("h3", { class: "card-title" }, "Unlimited packages"), h("div", { class: "form" }, fairL)),
+        h("div", { style: { marginTop: "14px" } }, example))),
+    error,
+    h("div", { class: "modal-actions" }, h("span", { class: "muted small" }, `Last changed ${fmtDate(s.updated_at)}`), save));
 }
 
 // ── Start ─────────────────────────────────────────────────────────────────

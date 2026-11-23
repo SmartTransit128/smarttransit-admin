@@ -7,7 +7,7 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src https://fpavhievwedzyqbfooic.supabase.co; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'self'; form-action 'self'">
 <meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#de6e1a">
-<title>SmartTransit Admin</title>
+<title>TeleTransit Admin</title>
 <link rel="icon" href="favicon.png">
 <link rel="stylesheet" href="admin.css">
 <script src="admin.js" defer></script>
@@ -17,8 +17,8 @@
 <!-- Sign in -->
 <section id="signin-view" class="signin" hidden>
   <form id="signin-form" class="signin-card" novalidate>
-    <div class="brand big"><img src="favicon.png" alt="">SmartTransit <span>Admin</span></div>
-    <p class="muted">Sign in with your SmartTransit admin account (same email and password as the app).</p>
+    <div class="brand big"><img src="favicon.png" alt="">TeleTransit <span>Admin</span></div>
+    <p class="muted">Sign in with your TeleTransit admin account (same email and password as the app).</p>
     <label>Email
       <input id="signin-email" type="email" autocomplete="username" required>
     </label>
@@ -33,15 +33,19 @@
 <!-- Dashboard -->
 <div id="app-view" class="shell" hidden>
   <aside class="sidebar">
-    <div class="brand"><img src="favicon.png" alt="">SmartTransit <span>Admin</span></div>
+    <div class="brand"><img src="favicon.png" alt="">TeleTransit <span>Admin</span></div>
     <nav id="nav">
       <a href="#overview" data-view="overview">Overview</a>
+      <a href="#business" data-view="business">Business</a>
       <a href="#payments" data-view="payments">Payments</a>
+      <a href="#payouts" data-view="payouts">Payouts</a>
+      <a href="#partners" data-view="partners">Partners</a>
       <a href="#customers" data-view="customers">Customers</a>
       <a href="#packages" data-view="packages">Packages &amp; prices</a>
       <a href="#offers" data-view="offers">Offers</a>
       <a href="#insights" data-view="insights">Insights</a>
       <a href="#posts" data-view="posts">Posts</a>
+      <a href="#settings" data-view="settings">Settings</a>
     </nav>
     <div class="who">
       <div id="who-name" class="who-name"></div>
