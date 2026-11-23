@@ -32,6 +32,8 @@ const PACKAGE_NAMES = {
 };
 // Names admins set in the catalog (name_en) win over the built-in ones.
 const catalogNames = {};
+// The smallest payment Pesapal accepts.
+const PESAPAL_MINIMUM = 1000;
 const packageName = (id) => catalogNames[id] || PACKAGE_NAMES[id] || id || "—";
 
 async function loadCatalogNames() {
@@ -298,6 +300,7 @@ let me = null;
 function showSignIn(message) {
   store.clear();
   me = null;
+  stopAlerts();
   closeModal();
   $("app-view").hidden = true;
   $("signin-view").hidden = false;
@@ -326,6 +329,89 @@ async function enterApp() {
   $("app-view").hidden = false;
   await loadCatalogNames();
   route();
+  startAlerts();
+}
+
+// ── Alerts: partners waiting to be paid ───────────────────────────────────
+// Checked every minute while the dashboard is open: a bar at the top, a
+// count on "Payouts" and in the tab title, and (if allowed) a desktop
+// notification for each new request.
+
+const BASE_TITLE = document.title;
+let alertTimer = null;
+let knownRequests = null;
+
+function startAlerts() {
+  clearInterval(alertTimer);
+  knownRequests = null;
+  checkPayouts();
+  alertTimer = setInterval(checkPayouts, 60000);
+}
+
+function stopAlerts() {
+  clearInterval(alertTimer);
+  alertTimer = null;
+  knownRequests = null;
+  document.title = BASE_TITLE;
+  document.querySelector("#nav .nav-badge")?.remove();
+  const bar = $("alert-bar");
+  if (bar) bar.hidden = true;
+}
+
+async function checkPayouts() {
+  if (!me) return;
+  let list;
+  try {
+    list = (await rpc("admin_withdrawals", { p_status: "requested" })) || [];
+  } catch {
+    return; // Try again next minute.
+  }
+  const n = list.length;
+  const total = list.reduce((t, w) => t + num(w.amount), 0);
+
+  const link = document.querySelector('#nav a[data-view="payouts"]');
+  let badge = link?.querySelector(".nav-badge");
+  if (n && link) {
+    if (!badge) { badge = h("span", { class: "nav-badge" }); link.append(badge); }
+    badge.textContent = String(n);
+  } else {
+    badge?.remove();
+  }
+  document.title = n ? `(${n}) ${BASE_TITLE}` : BASE_TITLE;
+
+  const bar = $("alert-bar");
+  if (bar) {
+    bar.hidden = !n;
+    if (n) {
+      const canAsk = "Notification" in window && Notification.permission === "default";
+      bar.replaceChildren(
+        h("span", {}, h("b", {}, n === 1 ? "1 partner is waiting to be paid" : `${count(n)} partners are waiting to be paid`),
+          ` · ${tzs(total)} in total`),
+        h("span", { class: "alert-actions" },
+          canAsk ? h("button", { class: "btn ghost small", type: "button", onclick: async () => {
+            await Notification.requestPermission();
+            checkPayouts();
+          } }, "Turn on desktop alerts") : null,
+          h("a", { class: "btn primary small", href: "#payouts" }, "Open payouts")));
+    }
+  }
+
+  // New since the last check (not on the first check after signing in).
+  if (knownRequests) {
+    const fresh = list.filter((w) => !knownRequests.has(w.id));
+    for (const w of fresh) {
+      const text = `${w.full_name || "A partner"} asked to withdraw ${tzs(w.amount)}`;
+      toast(text);
+      if ("Notification" in window && Notification.permission === "granted") {
+        try {
+          new Notification("Withdrawal request", { body: text, tag: w.id, icon: "favicon.png" });
+        } catch {
+          // Some browsers only allow notifications from a service worker.
+        }
+      }
+    }
+  }
+  knownRequests = new Set(list.map((w) => w.id));
 }
 
 /// Hash routes: #payments, #customers, #customers/<id>, …
@@ -369,11 +455,12 @@ function confirmDialog({ title, body, confirmLabel, danger }) {
 
 async function renderOverview(root) {
   root.append(loading());
-  const [summary, latest, insights, business] = await Promise.allSettled([
+  const [summary, latest, insights, business, sources] = await Promise.allSettled([
     rpc("admin_payment_summary"),
     rest(`payment_orders?select=${PAYMENT_SELECT}&order=created_at.desc&limit=8`),
     rpc("admin_insights"),
     rpc("admin_business_report", { p_days: 30 }),
+    rpc("admin_signup_sources", { p_days: 30 }),
   ]);
   root.replaceChildren();
   if (summary.status === "rejected") {
@@ -403,6 +490,22 @@ async function renderOverview(root) {
         linkStat("Active partners", count(u.partners), "#partners"),
         stat("Referred users", count(u.referred)),
         stat("Credits not yet used", count(u.credits_outstanding))),
+    );
+  }
+
+  if (sources.status === "fulfilled" && (sources.value || []).length) {
+    const labels = {
+      invited: "Invited by a partner", advert: "Advertisement", search: "Internet search",
+      social: "Social media", other: "Other", unanswered: "Not asked (older app)",
+    };
+    const list = sources.value;
+    const all = list.reduce((t, r) => t + num(r.people), 0);
+    root.append(
+      h("h2", {}, "How new people found TeleTransit (30 days)"),
+      h("div", { class: "card" }, list.map((r) => h("div", { class: "source-row" },
+        h("span", { class: "source-name" }, labels[r.source] || r.source),
+        h("span", { class: "source-bar" }, h("span", { style: { width: `${all ? Math.round(num(r.people) / all * 100) : 0}%` } })),
+        h("b", { class: "source-count" }, `${count(r.people)} · ${all ? Math.round(num(r.people) / all * 100) : 0}%`)))),
     );
   }
 
@@ -772,7 +875,7 @@ function packageEditor(pkg) {
 
   saveBtn.addEventListener("click", async () => {
     const v = values();
-    if (!Number.isInteger(v.amount) || v.amount < 100) { toast("Price must be a whole number of at least TZS 100.", true); return; }
+    if (!Number.isInteger(v.amount) || v.amount < PESAPAL_MINIMUM) { toast(`Price must be a whole number of at least ${tzs(PESAPAL_MINIMUM)}: Pesapal can't take less.`, true); return; }
     if (!topUp && (!Number.isInteger(v.listing_allowance) || v.listing_allowance < 1 || v.listing_allowance > 500)) { toast("Listings must be between 1 and 500.", true); return; }
     if (!topUp && (!Number.isInteger(v.validity_days) || v.validity_days < 1 || v.validity_days > 730)) { toast("Duration must be between 1 and 730 days.", true); return; }
     if ("contact_allowance" in v && (!Number.isInteger(v.contact_allowance) || v.contact_allowance < 1 || v.contact_allowance > 5000)) { toast(`${bundle ? "Credits" : "Customer numbers"} must be between 1 and 5000.`, true); return; }
@@ -998,6 +1101,13 @@ async function openOfferForm(offer, presetRecipients = []) {
     if (Number.isNaN(start.getTime()) || (end && Number.isNaN(end.getTime()))) return fail("Check the start and end dates.");
     if (end && end <= start) return fail("The end must be after the start.");
     if (audience.value === "selected" && !chosen.size) return fail("Choose at least one customer, or set “Who” to Everyone.");
+    // Pesapal can't take less than TZS 1,000, so no offer may go below it.
+    const affected = catalog.filter((c) => c.active !== false && num(c.amount) > 0 && (!pkg.value || c.id === pkg.value));
+    const tooCheap = affected.find((c) => Math.round(num(c.amount) * (100 - p) / 100) < PESAPAL_MINIMUM);
+    if (tooCheap) {
+      return fail(`${p}% off would make ${packageName(tooCheap.id)} cost ${tzs(Math.round(num(tooCheap.amount) * (100 - p) / 100))}. ` +
+        `Pesapal can't take less than ${tzs(PESAPAL_MINIMUM)}: choose a smaller discount${pkg.value ? "" : " or one package"}.`);
+    }
 
     const body = {
       title: title.value.trim(),
@@ -1393,13 +1503,14 @@ async function renderPartners(root, id) {
         stat("Paid out", tzs(totals.paid))),
       h("div", { class: "table-wrap" }, h("table", {},
         h("thead", {}, h("tr", {},
-          h("th", {}, "Partner"), h("th", {}, "Code"), h("th", { class: "num" }, "Referred"), h("th", { class: "num" }, "Paying"),
+          h("th", {}, "Partner"), h("th", {}, "Code"), h("th", { class: "num" }, "Referred"), h("th", { class: "num" }, "Paying"), h("th", { class: "num" }, "Level"),
           h("th", { class: "num" }, "Earned"), h("th", { class: "num" }, "Available"), h("th", { class: "num" }, "Paid out"), h("th", {}, "Status"))),
         h("tbody", {}, shown.map((p) => h("tr", { class: "click", onclick: () => { location.hash = `partners/${enc(p.user_id)}`; } },
           h("td", {}, p.full_name || "—", h("div", { class: "sub" }, p.phone || p.email || "")),
           h("td", {}, h("code", {}, p.code)),
           h("td", { class: "num" }, count(p.referrals)),
           h("td", { class: "num" }, count(p.paying)),
+          h("td", { class: "num" }, p.rate_bp == null ? "—" : h("b", {}, percentOf(p.rate_bp))),
           h("td", { class: "num" }, tzs(p.earned_total), num(p.reversed) ? h("div", { class: "sub" }, `${count(p.reversed)} reversed`) : null),
           h("td", { class: "num" }, h("span", { class: num(p.available) < 0 ? "neg" : "" }, tzs(p.available)),
             num(p.pending) ? h("div", { class: "sub" }, `+${tzs(p.pending)} waiting`) : null),
@@ -1408,6 +1519,35 @@ async function renderPartners(root, id) {
   }
   search.addEventListener("input", () => { partnersState.search = search.value; draw(); });
   draw();
+  root.append(h("h2", {}, "Latest partner earnings"), await latestEarnings());
+}
+
+/// The newest commissions across all partners: who earned, from whom, how much.
+async function latestEarnings() {
+  let rows;
+  try {
+    rows = await rest("partner_commissions?select=*,partner:profiles!partner_commissions_partner_id_fkey(full_name),buyer:profiles!partner_commissions_referred_id_fkey(full_name)&order=created_at.desc&limit=25");
+  } catch (err) {
+    return loadError(err, () => route());
+  }
+  if (!rows || !rows.length) return h("div", { class: "table-wrap" }, h("div", { class: "empty" }, "No earnings yet. They appear here as soon as someone who joined with a code pays."));
+  return h("div", { class: "table-wrap" }, h("table", {},
+    h("thead", {}, h("tr", {},
+      h("th", {}, "When"), h("th", {}, "Partner"), h("th", {}, "Bought by"), h("th", {}, "Package"),
+      h("th", { class: "num" }, "Paid"), h("th", { class: "num" }, "Rate"), h("th", { class: "num" }, "Earned"))),
+    h("tbody", {}, rows.map((c) => h("tr", { class: "click", onclick: () => { location.hash = `partners/${enc(c.partner_id)}`; } },
+      h("td", {}, fmtDate(c.created_at)),
+      h("td", {}, c.partner?.full_name || "—"),
+      h("td", {}, c.buyer?.full_name || "—"),
+      h("td", {}, packageName(c.package_id)),
+      h("td", { class: "num" }, tzs(c.order_amount)),
+      h("td", { class: "num" }, percentOf(c.rate_bp)),
+      h("td", { class: "num" }, c.status === "reversed" ? h("s", {}, tzs(c.amount)) : h("b", {}, tzs(c.amount))))))));
+}
+
+/// 500 -> "5%", 1250 -> "12.5%".
+function percentOf(bp) {
+  return `${Number((num(bp) / 100).toFixed(2))}%`;
 }
 
 async function renderPartner(root, id) {
@@ -1717,10 +1857,14 @@ function openWithdrawal(w) {
 async function renderSettings(root) {
   const body = h("div", {}, loading());
   root.append(body);
-  let s;
+  let s, levels;
   try {
-    const rows = await rest("business_settings?select=*");
+    const [rows, tiers] = await Promise.all([
+      rest("business_settings?select=*"),
+      rest("commission_tiers?select=*&order=min_people").catch(() => null),
+    ]);
     s = rows && rows[0];
+    levels = tiers && tiers.length ? tiers : [{ min_people: 1, rate_bp: s ? s.commission_bp : 2000 }];
   } catch (err) {
     body.replaceChildren(migrationMissing(err) ? planNotLive() : loadError(err, () => route()));
     return;
@@ -1731,40 +1875,76 @@ async function renderSettings(root) {
     const input = h("input", { type: "number", inputmode: "decimal", value: String(value), ...attrs });
     return [input, h("label", {}, label, input, h("span", { class: "hint" }, hint))];
   };
-  const [rate, rateL] = field("Partner commission (%)", num(s.commission_bp) / 100, "Share of each eligible purchase. The plan says 20%.", { min: "0", max: "50", step: "0.5" });
   const [ded, dedL] = field("Taken off first (%)", num(s.commission_deduction_bp) / 100, "For taxes and payment charges. 0 = the full price counts.", { min: "0", max: "50", step: "0.5" });
   const [hold, holdL] = field("Refund window (days)", s.commission_hold_days, "Earnings wait this long before they can be withdrawn.", { min: "0", max: "90", step: "1" });
-  const [minW, minL] = field("Smallest withdrawal (TZS)", s.min_withdrawal, "The plan says TZS 10,000.", { min: "1000", step: "1000" });
+  const [minW, minL] = field("Smallest withdrawal (TZS)", s.min_withdrawal, "Set this to the smallest amount you can send out. Pesapal shows its own minimum on the Withdraw Funds page of your Pesapal dashboard.", { min: "1000", step: "1000" });
   const [fair, fairL] = field("Fair use: new numbers per day", s.fair_use_daily, "Most new people one unlimited package can open in 24 hours.", { min: "5", max: "1000", step: "1" });
   const signupsOpen = h("input", { type: "checkbox" });
   signupsOpen.checked = s.partner_signups_open !== false;
   const signupsLabel = h("div", { class: "form" },
     h("label", { class: "switch" }, signupsOpen, "Accept new partners"),
     h("span", { class: "hint" }, "Turn off to pause new people joining the partner programme. Existing partners keep earning, withdrawing and referring."));
+
+  // ── Commission levels ──
+  // Each row: from N paying people up, the partner earns R% of each purchase.
+  const rows = levels.map((l) => ({ from: String(l.min_people), rate: String(num(l.rate_bp) / 100) }));
+  rows[0].from = "1";
+  const levelsBox = h("div", {});
   const example = h("div", { class: "card offer-preview" });
+  const readLevels = () => rows.map((r) => ({ min_people: Number(r.from), rate_bp: Math.round(Number(r.rate) * 100) }));
   const drawExample = () => {
-    const r = Number(rate.value) * 100, d = Number(ded.value) * 100;
-    const on = (amount) => Math.floor((amount * (10000 - d)) / 10000 * r / 10000);
-    example.replaceChildren(h("div", { class: "chart-title" }, "What a partner earns"),
-      ...[["Daily", 500], ["Monthly", 2500], ["Annual", 10000], ["Premium bundle", 4000]].map(([name, amount]) => h("div", { class: "list-row" },
-        h("span", {}, `${name} (${tzs(amount)})`), h("b", {}, Number.isFinite(on(amount)) ? tzs(on(amount)) : "—"))));
+    const ls = readLevels();
+    const d = Number(ded.value) * 100;
+    const on = (amount, bp) => Math.floor((amount * (10000 - d)) / 10000 * bp / 10000);
+    const amounts = [1000, 2500, 10000];
+    example.replaceChildren(h("div", { class: "chart-title" }, "What a partner earns on one purchase"),
+      h("table", { class: "mini" },
+        h("thead", {}, h("tr", {}, h("th", {}, "Paying people"), ...amounts.map((a) => h("th", { class: "num" }, tzs(a))))),
+        h("tbody", {}, ls.map((l, i) => h("tr", {},
+          h("td", {}, i + 1 < ls.length ? `${count(l.min_people)}–${count(ls[i + 1].min_people - 1)}` : `${count(l.min_people)}+`,
+            h("span", { class: "muted" }, ` · ${percentOf(l.rate_bp)}`)),
+          ...amounts.map((a) => h("td", { class: "num" }, Number.isFinite(on(a, l.rate_bp)) ? tzs(on(a, l.rate_bp)) : "—")))))));
   };
-  [rate, ded].forEach((i) => i.addEventListener("input", drawExample));
+  const drawLevels = () => {
+    levelsBox.replaceChildren(
+      h("div", { class: "levels" }, rows.map((r, i) => {
+        const from = h("input", { type: "number", min: "1", step: "1", inputmode: "numeric", value: r.from, disabled: i === 0 });
+        const rate = h("input", { type: "number", min: "0", max: "50", step: "0.5", inputmode: "decimal", value: r.rate });
+        from.addEventListener("input", () => { r.from = from.value; drawExample(); });
+        rate.addEventListener("input", () => { r.rate = rate.value; drawExample(); });
+        return h("div", { class: "level-row" },
+          h("label", {}, "From person", from),
+          h("label", {}, "Earns (%)", rate),
+          i === 0 ? h("span", {}) : h("button", { class: "btn ghost small", type: "button", title: "Remove this level",
+            onclick: () => { rows.splice(i, 1); drawLevels(); drawExample(); } }, "Remove"));
+      })),
+      h("button", { class: "btn ghost small", type: "button", onclick: () => {
+        const last = rows[rows.length - 1];
+        rows.push({ from: String(Number(last.from || 1) + 50), rate: last.rate });
+        drawLevels(); drawExample();
+      } }, "+ Add a level"));
+  };
+  ded.addEventListener("input", drawExample);
+  drawLevels();
   drawExample();
 
   const error = h("p", { class: "error", hidden: true });
   const save = h("button", { class: "btn primary", type: "button" }, "Save settings");
   save.addEventListener("click", async () => {
     error.hidden = true;
+    const ls = readLevels();
     const v = {
-      commission_bp: Math.round(Number(rate.value) * 100),
       commission_deduction_bp: Math.round(Number(ded.value) * 100),
       commission_hold_days: Number(hold.value),
       min_withdrawal: Number(minW.value),
       fair_use_daily: Number(fair.value),
       partner_signups_open: signupsOpen.checked,
     };
-    const bad = (!(v.commission_bp >= 0 && v.commission_bp <= 5000) && "Commission must be between 0% and 50%.")
+    const levelProblem = ls.map((l, i) =>
+      (!Number.isInteger(l.min_people) || l.min_people < 1) ? `Level ${i + 1}: “From person” must be a whole number.`
+        : (i > 0 && l.min_people <= ls[i - 1].min_people) ? `Level ${i + 1} must start above level ${i} (${count(ls[i - 1].min_people)}).`
+          : (!(l.rate_bp >= 0 && l.rate_bp <= 5000)) ? `Level ${i + 1}: the rate must be between 0% and 50%.` : null).find(Boolean);
+    const bad = levelProblem
       || (!(v.commission_deduction_bp >= 0 && v.commission_deduction_bp <= 5000) && "“Taken off first” must be between 0% and 50%.")
       || (!(Number.isInteger(v.commission_hold_days) && v.commission_hold_days >= 0 && v.commission_hold_days <= 90) && "The refund window must be 0 to 90 days.")
       || (!(Number.isInteger(v.min_withdrawal) && v.min_withdrawal >= 1000) && "The smallest withdrawal must be at least TZS 1,000.")
@@ -1773,8 +1953,9 @@ async function renderSettings(root) {
     save.disabled = true;
     save.replaceChildren(h("span", { class: "spinner" }), "Saving…");
     try {
-      const rows = await rest("business_settings?id=eq.true", { method: "PATCH", body: v, prefer: "return=representation" });
-      if (!rows || !rows[0]) throw new ApiError("forbidden", 403, "Not allowed to change settings");
+      await rpc("admin_set_commission_tiers", { p_tiers: ls });
+      const saved = await rest("business_settings?id=eq.true", { method: "PATCH", body: v, prefer: "return=representation" });
+      if (!saved || !saved[0]) throw new ApiError("forbidden", 403, "Not allowed to change settings");
       toast("Settings saved. New purchases use them from now on.");
       route();
     } catch (err) {
@@ -1788,11 +1969,14 @@ async function renderSettings(root) {
   body.replaceChildren(
     h("div", { class: "note" }, "Changes apply to purchases made from now on. Commissions already earned keep the rate they were earned at."),
     h("div", { class: "grid2" },
-      h("div", { class: "card" }, h("h3", { class: "card-title" }, "Partner programme"),
-        h("div", { class: "form" }, rateL, dedL, holdL, minL), signupsLabel),
+      h("div", { class: "card" }, h("h3", { class: "card-title" }, "Commission levels"),
+        h("p", { class: "muted small" }, "A partner's level counts the people they brought who have paid at least once. Every new purchase earns the rate of the level they are on."),
+        levelsBox,
+        h("div", { style: { marginTop: "14px" } }, example)),
       h("div", {},
-        h("div", { class: "card" }, h("h3", { class: "card-title" }, "Unlimited packages"), h("div", { class: "form" }, fairL)),
-        h("div", { style: { marginTop: "14px" } }, example))),
+        h("div", { class: "card" }, h("h3", { class: "card-title" }, "Partner programme"),
+          h("div", { class: "form" }, dedL, holdL, minL), signupsLabel),
+        h("div", { class: "card", style: { marginTop: "14px" } }, h("h3", { class: "card-title" }, "Unlimited packages"), h("div", { class: "form" }, fairL)))),
     error,
     h("div", { class: "modal-actions" }, h("span", { class: "muted small" }, `Last changed ${fmtDate(s.updated_at)}`), save));
 }
