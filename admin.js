@@ -332,18 +332,18 @@ async function enterApp() {
   startAlerts();
 }
 
-// ── Alerts: partners waiting to be paid ───────────────────────────────────
+// ── Alerts: partners due a payout ─────────────────────────────────────────
 // Checked every minute while the dashboard is open: a bar at the top, a
 // count on "Payouts" and in the tab title, and (if allowed) a desktop
-// notification for each new request.
+// notification when a partner newly reaches the payout threshold.
 
 const BASE_TITLE = document.title;
 let alertTimer = null;
-let knownRequests = null;
+let knownDue = null;
 
 function startAlerts() {
   clearInterval(alertTimer);
-  knownRequests = null;
+  knownDue = null;
   checkPayouts();
   alertTimer = setInterval(checkPayouts, 60000);
 }
@@ -351,7 +351,7 @@ function startAlerts() {
 function stopAlerts() {
   clearInterval(alertTimer);
   alertTimer = null;
-  knownRequests = null;
+  knownDue = null;
   document.title = BASE_TITLE;
   document.querySelector("#nav .nav-badge")?.remove();
   const bar = $("alert-bar");
@@ -360,14 +360,15 @@ function stopAlerts() {
 
 async function checkPayouts() {
   if (!me) return;
-  let list;
+  let due;
   try {
-    list = (await rpc("admin_withdrawals", { p_status: "requested" })) || [];
+    due = (await rpc("admin_payouts_due")) || {};
   } catch {
     return; // Try again next minute.
   }
+  const list = due.partners || [];
   const n = list.length;
-  const total = list.reduce((t, w) => t + num(w.amount), 0);
+  const total = list.reduce((t, p) => t + num(p.amount), 0);
 
   const link = document.querySelector('#nav a[data-view="payouts"]');
   let badge = link?.querySelector(".nav-badge");
@@ -384,9 +385,10 @@ async function checkPayouts() {
     bar.hidden = !n;
     if (n) {
       const canAsk = "Notification" in window && Notification.permission === "default";
+      const when = due.is_payout_day ? "Today is payout day" : `Next payout day: ${fmtDate(due.next_payout, false)}`;
       bar.replaceChildren(
-        h("span", {}, h("b", {}, n === 1 ? "1 partner is waiting to be paid" : `${count(n)} partners are waiting to be paid`),
-          ` · ${tzs(total)} in total`),
+        h("span", {}, h("b", {}, n === 1 ? "1 partner is due a payout" : `${count(n)} partners are due a payout`),
+          ` · ${tzs(total)} in total · ${when}`),
         h("span", { class: "alert-actions" },
           canAsk ? h("button", { class: "btn ghost small", type: "button", onclick: async () => {
             await Notification.requestPermission();
@@ -396,22 +398,21 @@ async function checkPayouts() {
     }
   }
 
-  // New since the last check (not on the first check after signing in).
-  if (knownRequests) {
-    const fresh = list.filter((w) => !knownRequests.has(w.id));
-    for (const w of fresh) {
-      const text = `${w.full_name || "A partner"} asked to withdraw ${tzs(w.amount)}`;
+  // Newly due since the last check (not on the first check after signing in).
+  if (knownDue) {
+    for (const p of list.filter((x) => !knownDue.has(x.partner_id))) {
+      const text = `${p.full_name || "A partner"} reached ${tzs(p.amount)}: due on ${fmtDate(due.next_payout, false)}`;
       toast(text);
       if ("Notification" in window && Notification.permission === "granted") {
         try {
-          new Notification("Withdrawal request", { body: text, tag: w.id, icon: "favicon.png" });
+          new Notification("Partner payout due", { body: text, tag: p.partner_id, icon: "favicon.png" });
         } catch {
           // Some browsers only allow notifications from a service worker.
         }
       }
     }
   }
-  knownRequests = new Set(list.map((w) => w.id));
+  knownDue = new Set(list.map((p) => p.partner_id));
 }
 
 /// Hash routes: #payments, #customers, #customers/<id>, …
@@ -455,12 +456,14 @@ function confirmDialog({ title, body, confirmLabel, danger }) {
 
 async function renderOverview(root) {
   root.append(loading());
-  const [summary, latest, insights, business, sources] = await Promise.allSettled([
+  const [summary, latest, insights, business, sources, due, wall] = await Promise.allSettled([
     rpc("admin_payment_summary"),
     rest(`payment_orders?select=${PAYMENT_SELECT}&order=created_at.desc&limit=8`),
     rpc("admin_insights"),
     rpc("admin_business_report", { p_days: 30 }),
     rpc("admin_signup_sources", { p_days: 30 }),
+    rpc("admin_payouts_due"),
+    rpc("admin_paywall_report", { p_days: 30 }),
   ]);
   root.replaceChildren();
   if (summary.status === "rejected") {
@@ -485,7 +488,9 @@ async function renderOverview(root) {
     root.append(
       h("h2", {}, "Partners & payouts"),
       h("div", { class: "stats" },
-        linkStat("Payouts waiting", count(c.waiting_count), "#payouts", num(c.waiting_count) ? "warn" : ""),
+        due.status === "fulfilled"
+          ? linkStat("Due for payout", `${count((due.value?.partners || []).length)} · ${tzs((due.value?.partners || []).reduce((t, p) => t + num(p.amount), 0))}`, "#payouts", (due.value?.partners || []).length ? "warn" : "")
+          : linkStat("Payouts waiting", count(c.waiting_count), "#payouts", num(c.waiting_count) ? "warn" : ""),
         linkStat("Owed to partners", tzs(c.owed), "#partners", "money"),
         linkStat("Active partners", count(u.partners), "#partners"),
         stat("Referred users", count(u.referred)),
@@ -509,6 +514,8 @@ async function renderOverview(root) {
     );
   }
 
+  if (wall.status === "fulfilled") root.append(paywallSection(wall.value || {}));
+
   if (insights.status === "fulfilled") {
     const d = insights.value || {};
     root.append(
@@ -525,6 +532,36 @@ async function renderOverview(root) {
   root.append(h("h2", {}, "Latest payments"));
   if (latest.status === "rejected") root.append(loadError(latest.reason));
   else root.append(paymentsTable(latest.value || [], true));
+}
+
+/// People who tried to open a number without a package or credits, and
+/// how many of them paid afterwards.
+function paywallSection(w) {
+  const people = num(w.people), bought = num(w.bought);
+  const pct = (a, b) => (b ? `${Math.round((a / b) * 100)}%` : "—");
+  const reasons = w.by_reason || {};
+  const reasonLabel = { no_package: "No package", no_contacts_left: "Numbers used up", fair_use: "Daily limit reached" };
+  const recent = w.recent || [];
+  return h("div", {},
+    h("h2", {}, `Payment wall (${count(w.days || 30)} days)`),
+    h("p", { class: "muted small" }, "People who tapped to open a number but had no package or credits left. Counted from app version 1.2.3."),
+    h("div", { class: "stats" },
+      stat("People who hit it", count(people), people ? "warn" : ""),
+      stat("Then bought", `${count(bought)} · ${pct(bought, people)}`, "ok"),
+      stat("Bought within a day", `${count(w.bought_within_day)} · ${pct(num(w.bought_within_day), people)}`),
+      stat("Did not buy", count(Math.max(0, people - bought)), people - bought > 0 ? "bad" : ""),
+      stat("Drivers opening customers", count(w.drivers)),
+      stat("Customers opening drivers", count(w.customers))),
+    Object.keys(reasons).length ? h("p", { class: "muted small" },
+      Object.entries(reasons).map(([k, v]) => `${reasonLabel[k] || k}: ${count(v)}`).join(" · ")) : null,
+    recent.length ? h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, h("th", {}, "Person"), h("th", {}, "First hit"), h("th", { class: "num" }, "Tries"), h("th", {}, "Why"), h("th", {}, "Bought?"))),
+      h("tbody", {}, recent.map((r) => h("tr", { class: "click", onclick: () => { location.hash = `#customers/${enc(r.user_id)}`; } },
+        h("td", {}, r.full_name || "—"),
+        h("td", {}, fmtDate(r.first_hit)),
+        h("td", { class: "num" }, count(r.hits)),
+        h("td", {}, reasonLabel[r.last_reason] || r.last_reason || "—"),
+        h("td", {}, r.bought_at ? h("span", { class: "badge ok" }, fmtDate(r.bought_at)) : h("span", { class: "badge grey" }, "Not yet"))))))) : null);
 }
 
 // ── Payments ──────────────────────────────────────────────────────────────
@@ -1682,7 +1719,7 @@ async function renderPartner(root, id) {
           h("td", { class: "num" }, reversed ? null : h("button", { class: "btn small danger", type: "button", onclick: () => reverse(c) }, "Reverse")));
       })))),
 
-    h("h2", {}, "Withdrawals"),
+    h("h2", {}, "Payouts"),
     withdrawalsTable(withdrawals, false),
   );
 }
@@ -1712,11 +1749,11 @@ function promptDialog({ title, body, label, confirmLabel, danger, placeholder, r
 
 // ── Payouts ───────────────────────────────────────────────────────────────
 
-const payoutsState = { status: "requested" };
+const payoutsState = { status: "paid" };
 
 function withdrawalBadge(status) {
   const map = {
-    requested: ["Waiting for you", "warn"], processing: ["Sending", "blue"], paid: ["Paid", "ok"],
+    requested: ["Asked (older app)", "warn"], processing: ["Sending", "blue"], paid: ["Paid", "ok"],
     failed: ["Didn't go through", "bad"], rejected: ["Rejected", "bad"], cancelled: ["Cancelled by partner", "grey"],
   };
   const [label, tone] = map[status] || [status, "grey"];
@@ -1729,39 +1766,33 @@ function withdrawalsTable(rows, withPartner, onOpen) {
   if (!rows.length) return h("div", { class: "table-wrap" }, h("div", { class: "empty" }, "No withdrawals here."));
   return h("div", { class: "table-wrap" }, h("table", {},
     h("thead", {}, h("tr", {},
-      h("th", {}, "Requested"), withPartner && h("th", {}, "Partner"), h("th", {}, "Send to"),
-      h("th", { class: "num" }, "Amount"), h("th", {}, "Status"), h("th", {}, "Reference"))),
+      h("th", {}, "Date"), withPartner && h("th", {}, "Partner"), h("th", {}, "Sent to"),
+      h("th", { class: "num" }, "Amount"), h("th", {}, "Status"), h("th", {}, "Transaction ID"))),
     h("tbody", {}, rows.map((w) => h("tr", { class: onOpen ? "click" : "", onclick: onOpen ? () => onOpen(w) : null },
-      h("td", {}, fmtDate(w.requested_at)),
+      h("td", {}, fmtDate(w.paid_at || w.requested_at)),
       withPartner && h("td", {}, w.full_name || "—", h("div", { class: "sub" }, w.code || "")),
       h("td", {}, `+${w.phone}`, h("div", { class: "sub" }, NETWORKS[w.network] || w.network)),
       h("td", { class: "num" }, tzs(w.amount)),
       h("td", {}, withdrawalBadge(w.status), w.provider_message ? h("div", { class: "sub" }, w.provider_message) : null),
-      h("td", {}, h("code", {}, w.reference), w.provider_reference ? h("div", { class: "sub" }, w.provider_reference) : null))))));
+      h("td", {}, w.provider_reference ? h("code", {}, w.provider_reference) : "—", h("div", { class: "sub" }, w.reference)))))));
 }
 
 async function renderPayouts(root) {
-  const filters = [["requested", "Waiting for you"], ["processing", "Sending"], ["paid", "Paid"], ["failed", "Didn't go through"], ["rejected", "Rejected"], [null, "All"]];
-  const setup = h("div", {});
+  const filters = [["paid", "Paid"], ["requested", "Asked (older app)"], ["processing", "Sending"], ["failed", "Didn't go through"], ["rejected", "Rejected"], [null, "All"]];
+  const dueBox = h("div", {}, loading());
   const list = h("div", {}, loading());
   root.append(
-    setup,
+    dueBox,
+    h("h2", {}, "Payout history"),
     h("div", { class: "toolbar" }, h("div", { class: "chips" }, filters.map(([v, label]) => h("button", {
       type: "button", class: `chip ${payoutsState.status === v ? "on" : ""}`,
       onclick: () => { payoutsState.status = v; route(); },
     }, label)))),
     list);
 
-  edgeGet("partner-payout")
-    .then((s) => {
-      setup.replaceChildren(s && s.configured
-        ? h("div", { class: "note ok" }, "AzamPay payouts are set up: “Send with AzamPay” sends the money to the partner's phone.")
-        : h("div", { class: "note" },
-            "AzamPay payouts aren't set up yet, so “Send with AzamPay” won't work. You can still pay partners yourself and record it with “Mark as paid”. ",
-            s && s.missing && s.missing.length ? h("span", { class: "small" }, `Missing: ${s.missing.join(", ")}.`) : null));
-    })
-    .catch(() => setup.replaceChildren(h("div", { class: "note" },
-      "Couldn't check the AzamPay payout setup (the partner-payout function may not be deployed yet). “Mark as paid” still works.")));
+  rpc("admin_payouts_due")
+    .then((due) => dueBox.replaceChildren(...payoutsDueSection(due || {})))
+    .catch((err) => dueBox.replaceChildren(migrationMissing(err) ? planNotLive() : loadError(err, () => route())));
 
   let rows;
   try {
@@ -1772,8 +1803,100 @@ async function renderPayouts(root) {
   }
   const total = rows.reduce((t, w) => t + num(w.amount), 0);
   list.replaceChildren(
-    h("p", { class: "muted small" }, `${rows.length} withdrawal${rows.length === 1 ? "" : "s"} · ${tzs(total)}`),
+    h("p", { class: "muted small" }, `${rows.length} payout${rows.length === 1 ? "" : "s"} · ${tzs(total)}`),
     withdrawalsTable(rows, true, openWithdrawal));
+}
+
+function payoutDaysText(days) {
+  const d = [...(days || [])].sort((a, b) => a - b);
+  return d.length ? `day ${d.join(" & ")} of each month` : "—";
+}
+
+/// Partners at or above the threshold, each with a "Record payout" button.
+function payoutsDueSection(due) {
+  const partners = due.partners || [];
+  const total = partners.reduce((t, p) => t + num(p.amount), 0);
+  return [
+    h("div", { class: due.is_payout_day ? "note ok" : "note" },
+      due.is_payout_day ? h("b", {}, "Today is payout day. ") : null,
+      `Partners are paid on ${payoutDaysText(due.payout_days)} once their balance reaches ${tzs(due.threshold)}. `,
+      `Next payout day: ${fmtDate(due.next_payout, false)}. `,
+      "Send the money from your mobile-money phone or agent, then record it here with the transaction ID: the partner's balance goes back to 0 and the payment is kept in the history. ",
+      h("a", { href: "#settings" }, "Change the days or threshold")),
+    h("h2", {}, `Due for payout · ${count(partners.length)} · ${tzs(total)}`),
+    partners.length
+      ? h("div", { class: "table-wrap" }, h("table", {},
+          h("thead", {}, h("tr", {},
+            h("th", {}, "Partner"), h("th", {}, "Send to"), h("th", { class: "num" }, "Amount"),
+            h("th", {}, "Last paid"), h("th", {}, ""))),
+          h("tbody", {}, partners.map((p) => {
+            const to = p.send_to || {};
+            return h("tr", {},
+              h("td", {}, h("a", { href: `#partners/${enc(p.partner_id)}` }, p.full_name || "—"), h("div", { class: "sub" }, p.code || "")),
+              h("td", {}, to.phone ? `+${to.phone}` : "—",
+                h("div", { class: "sub" }, to.network ? (NETWORKS[to.network] || to.network) : "Network not chosen"),
+                to.chosen ? null : h("div", { class: "sub" }, "Main phone (partner hasn't chosen a payout number)")),
+              h("td", { class: "num" }, h("b", {}, tzs(p.amount)), num(p.pending) ? h("div", { class: "sub" }, `+ ${tzs(p.pending)} still in refund window`) : null),
+              h("td", {}, p.last_paid_at ? fmtDate(p.last_paid_at, false) : "Never"),
+              h("td", { class: "num" }, p.sending
+                ? h("span", { class: "badge blue" }, "AzamPay sending")
+                : h("button", { class: "btn primary small", type: "button", onclick: () => recordPayoutDialog(p) }, "Record payout")));
+          }))))
+      : h("div", { class: "table-wrap" }, h("div", { class: "empty" }, `No partner has reached ${tzs(due.threshold)} yet.`)),
+  ];
+}
+
+/// The admin sent the money: record it (whole balance, back to 0).
+function recordPayoutDialog(p) {
+  const to = p.send_to || {};
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: TIME_ZONE });
+  const phone = h("input", { type: "tel", value: to.phone ? `0${String(to.phone).slice(3)}` : "", placeholder: "07…" });
+  const network = h("select", {}, h("option", { value: "" }, "Choose…"),
+    Object.entries(NETWORKS).map(([v, label]) => h("option", { value: v, selected: v === to.network }, label)));
+  const txn = h("input", { type: "text", maxlength: "100", placeholder: "e.g. QK41ABC9XY" });
+  const date = h("input", { type: "date", value: today, max: today });
+  const note = h("input", { type: "text", maxlength: "300", placeholder: "Optional" });
+  const error = h("p", { class: "error", hidden: true });
+  const save = h("button", { class: "btn primary", type: "button" }, `Record ${tzs(p.amount)} as paid`);
+  save.addEventListener("click", async () => {
+    error.hidden = true;
+    const bad = !txn.value.trim() ? "Enter the mobile-money transaction ID."
+      : !network.value ? "Choose the network you sent it on."
+        : !phone.value.trim() ? "Enter the number you sent it to." : null;
+    if (bad) { error.textContent = bad; error.hidden = false; return; }
+    save.disabled = true;
+    save.replaceChildren(h("span", { class: "spinner" }), "Recording…");
+    try {
+      await rpc("admin_record_payout", {
+        p_partner: p.partner_id, p_expected: num(p.amount), p_phone: phone.value.trim(),
+        p_network: network.value, p_reference: txn.value.trim(),
+        p_paid_on: date.value || null, p_note: note.value.trim() || null,
+      });
+      toast(`Recorded: ${tzs(p.amount)} paid to ${p.full_name || "the partner"}. Their balance is now 0.`);
+      closeModal();
+      checkPayouts();
+      route();
+    } catch (err) {
+      error.textContent = `Couldn't record it. ${errorText(err)}`;
+      error.hidden = false;
+      save.disabled = false;
+      save.replaceChildren(`Record ${tzs(p.amount)} as paid`);
+    }
+  });
+  openModal(
+    h("h2", { style: { marginTop: "0" } }, `Record a payout to ${p.full_name || "this partner"}`),
+    h("p", { class: "muted" }, `Only after the money has arrived. The whole balance, ${tzs(p.amount)}, is recorded as paid and the partner's balance goes back to 0. Earnings still in the refund window stay for the next payout.`),
+    h("div", { class: "form" },
+      h("label", {}, "Amount", h("input", { type: "text", value: tzs(p.amount), disabled: true })),
+      h("label", {}, "Sent to number", phone),
+      h("label", {}, "Network", network),
+      h("label", {}, "Transaction ID", txn),
+      h("label", {}, "Date paid", date),
+      h("label", {}, "Note", note)),
+    error,
+    h("div", { class: "modal-actions" },
+      h("button", { class: "btn", type: "button", onclick: closeModal }, "Cancel"), save));
+  setTimeout(() => txn.focus(), 0);
 }
 
 function openWithdrawal(w) {
@@ -1814,7 +1937,20 @@ function openWithdrawal(w) {
     });
     actions.push(check);
   }
-  if (["requested", "processing", "failed"].includes(w.status)) {
+  if (w.status === "requested") {
+    const pay = h("button", { class: "btn primary", type: "button" }, "Record payout (whole balance)");
+    pay.addEventListener("click", async () => {
+      busy(pay, "Loading…");
+      try {
+        const due = (await rpc("admin_payouts_due")) || {};
+        const p = (due.partners || []).find((x) => x.partner_id === w.partner_id);
+        if (p) recordPayoutDialog(p);
+        else toast(`This partner's balance is below the payout threshold (${tzs(due.threshold)}). Reject the request; they'll be paid once they reach it.`, true);
+      } catch (err) { toast(errorText(err), true); openWithdrawal(w); }
+    });
+    actions.push(pay);
+  }
+  if (["processing", "failed"].includes(w.status)) {
     const paid = h("button", { class: "btn", type: "button" }, "Mark as paid");
     paid.addEventListener("click", async () => {
       const ref = await promptDialog({
@@ -1861,9 +1997,9 @@ function openWithdrawal(w) {
     h("dl", { class: "kv" },
       h("dt", {}, "Send to"), h("dd", {}, `+${w.phone} · ${NETWORKS[w.network] || w.network}`),
       h("dt", {}, "Partner"), h("dd", {}, h("a", { href: `#partners/${enc(w.partner_id)}` }, `${w.full_name || "—"} (${w.code || "—"})`)),
-      h("dt", {}, "Requested"), h("dd", {}, fmtDate(w.requested_at)),
+      h("dt", {}, "Recorded"), h("dd", {}, fmtDate(w.requested_at)),
+      h("dt", {}, "Transaction ID"), h("dd", {}, w.provider_reference || "—"),
       h("dt", {}, "Our reference"), h("dd", {}, w.reference),
-      h("dt", {}, "AzamPay reference"), h("dd", {}, w.provider_reference || "—"),
       h("dt", {}, "Message"), h("dd", {}, w.provider_message || w.admin_note || "—"),
       h("dt", {}, "Paid"), h("dd", {}, w.paid_at ? `${fmtDate(w.paid_at)}${w.paid_manually ? " (recorded by hand)" : ""}` : "—")),
     h("div", { class: "modal-actions" }, ...actions, h("button", { class: "btn", type: "button", onclick: closeModal }, "Close")));
@@ -1894,13 +2030,16 @@ async function renderSettings(root) {
   };
   const [ded, dedL] = field("Taken off first (%)", num(s.commission_deduction_bp) / 100, "For taxes and payment charges. 0 = the full price counts.", { min: "0", max: "50", step: "0.5" });
   const [hold, holdL] = field("Refund window (days)", s.commission_hold_days, "Earnings wait this long before they can be withdrawn.", { min: "0", max: "90", step: "1" });
-  const [minW, minL] = field("Smallest withdrawal (TZS)", s.min_withdrawal, "Set this to the smallest amount you can send out. Pesapal shows its own minimum on the Withdraw Funds page of your Pesapal dashboard.", { min: "1000", step: "1000" });
+  const [minW, minL] = field("Payout threshold (TZS)", s.min_withdrawal, "A partner is paid once their balance reaches this.", { min: "1000", step: "1000" });
+  const daysInput = h("input", { type: "text", inputmode: "numeric", value: (s.payout_days || [1]).join(", "), placeholder: "1" });
+  const hasPayoutDays = Array.isArray(s.payout_days);
+  const daysL = h("label", {}, "Payout days of the month", daysInput, h("span", { class: "hint" }, "Days 1 to 28, separated by commas. One day a month keeps transfer fees low. Partners see the next one in the app."));
   const [fair, fairL] = field("Fair use: new numbers per day", s.fair_use_daily, "Most new people one unlimited package can open in 24 hours.", { min: "5", max: "1000", step: "1" });
   const signupsOpen = h("input", { type: "checkbox" });
   signupsOpen.checked = s.partner_signups_open !== false;
   const signupsLabel = h("div", { class: "form" },
     h("label", { class: "switch" }, signupsOpen, "Accept new partners"),
-    h("span", { class: "hint" }, "Turn off to pause new people joining the partner programme. Existing partners keep earning, withdrawing and referring."));
+    h("span", { class: "hint" }, "Turn off to pause new people joining the partner programme. Existing partners keep earning, getting paid and referring."));
 
   // ── Commission levels ──
   // Each row: from N paying people up, the partner earns R% of each purchase.
@@ -1954,6 +2093,7 @@ async function renderSettings(root) {
       commission_deduction_bp: Math.round(Number(ded.value) * 100),
       commission_hold_days: Number(hold.value),
       min_withdrawal: Number(minW.value),
+      ...(hasPayoutDays ? { payout_days: [...new Set(daysInput.value.split(/[^0-9]+/).filter(Boolean).map(Number))].sort((a, b) => a - b) } : {}),
       fair_use_daily: Number(fair.value),
       partner_signups_open: signupsOpen.checked,
     };
@@ -1964,7 +2104,8 @@ async function renderSettings(root) {
     const bad = levelProblem
       || (!(v.commission_deduction_bp >= 0 && v.commission_deduction_bp <= 5000) && "“Taken off first” must be between 0% and 50%.")
       || (!(Number.isInteger(v.commission_hold_days) && v.commission_hold_days >= 0 && v.commission_hold_days <= 90) && "The refund window must be 0 to 90 days.")
-      || (!(Number.isInteger(v.min_withdrawal) && v.min_withdrawal >= 1000) && "The smallest withdrawal must be at least TZS 1,000.")
+      || (!(Number.isInteger(v.min_withdrawal) && v.min_withdrawal >= 1000) && "The payout threshold must be at least TZS 1,000.")
+      || (hasPayoutDays && !(v.payout_days.length >= 1 && v.payout_days.length <= 8 && v.payout_days.every((d) => d >= 1 && d <= 28)) && "Payout days must be 1 to 8 days between 1 and 28.")
       || (!(Number.isInteger(v.fair_use_daily) && v.fair_use_daily >= 5 && v.fair_use_daily <= 1000) && "Fair use must be 5 to 1000.");
     if (bad) { error.textContent = bad; error.hidden = false; return; }
     save.disabled = true;
@@ -1992,7 +2133,7 @@ async function renderSettings(root) {
         h("div", { style: { marginTop: "14px" } }, example)),
       h("div", {},
         h("div", { class: "card" }, h("h3", { class: "card-title" }, "Partner programme"),
-          h("div", { class: "form" }, dedL, holdL, minL), signupsLabel),
+          h("div", { class: "form" }, dedL, holdL, minL, hasPayoutDays ? daysL : null), signupsLabel),
         h("div", { class: "card", style: { marginTop: "14px" } }, h("h3", { class: "card-title" }, "Unlimited packages"), h("div", { class: "form" }, fairL)))),
     error,
     h("div", { class: "modal-actions" }, h("span", { class: "muted small" }, `Last changed ${fmtDate(s.updated_at)}`), save));
