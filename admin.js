@@ -948,6 +948,7 @@ function offerState(o) {
 
 /// Same rounding as the database: nearest TZS 100, never below TZS 100.
 function offerPrice(amount, percentOff) {
+  if (percentOff >= 100) return 0; // 100% off = free, claimed once per person
   return Math.max(100, Math.round((amount * (100 - percentOff)) / 10000) * 100);
 }
 
@@ -967,21 +968,28 @@ async function renderOffers(root) {
     list.replaceChildren(offersMissing(err) ? offersNotLive() : loadError(err, () => route()));
     return;
   }
+  // How many people used each offer (paid with it, or claimed it free).
+  const used = new Map();
+  try {
+    const orders = await rest("payment_orders?select=offer_id,status,amount&offer_id=not.is.null&limit=10000");
+    for (const o of orders) if (o.status === "completed" || (num(o.amount) === 0 && o.status !== "failed")) used.set(o.offer_id, (used.get(o.offer_id) || 0) + 1);
+  } catch (_) { /* the count is a nicety; the list still works */ }
   if (!offers.length) {
     list.replaceChildren(h("div", { class: "table-wrap" }, h("div", { class: "empty" }, "No offers yet. Create one with “New offer”.")));
     return;
   }
   list.replaceChildren(h("div", { class: "table-wrap" }, h("table", {},
     h("thead", {}, h("tr", {},
-      h("th", {}, "Offer"), h("th", {}, "Discount"), h("th", {}, "Who"), h("th", {}, "When"), h("th", {}, "Status"), h("th", {}, ""))),
+      h("th", {}, "Offer"), h("th", {}, "Discount"), h("th", {}, "Who"), h("th", {}, "When"), h("th", {}, "Used"), h("th", {}, "Status"), h("th", {}, ""))),
     h("tbody", {}, offers.map((o) => {
       const [label, tone] = offerState(o);
       const recipients = num(o.recipients?.[0]?.count);
       return h("tr", { class: "click", onclick: (e) => { if (!e.target.closest("button")) openOfferForm(o); } },
         h("td", {}, o.title),
-        h("td", {}, `${o.percent_off}% off`, h("div", { class: "sub" }, o.package_id ? packageName(o.package_id) : "All packages")),
+        h("td", {}, o.percent_off >= 100 ? "FREE (100% off)" : `${o.percent_off}% off`, h("div", { class: "sub" }, o.package_id ? packageName(o.package_id) : "All packages")),
         h("td", {}, o.audience === "selected" ? `${recipients} chosen customer${recipients === 1 ? "" : "s"}` : "Everyone"),
         h("td", {}, fmtDate(o.starts_at), h("div", { class: "sub" }, o.ends_at ? `until ${fmtDate(o.ends_at)}` : "no end date")),
+        h("td", {}, `${used.get(o.id) || 0} ${o.max_claims ? `of ${o.max_claims}` : "people"}`, h("div", { class: "sub" }, o.max_claims ? "used so far" : "no limit")),
         h("td", {}, h("span", { class: `badge ${tone}` }, label)),
         h("td", { class: "num" },
           h("button", { class: "btn small", type: "button", onclick: () => setOfferActive(o, !o.active) }, o.active ? "Pause" : "Resume")));
@@ -1026,13 +1034,14 @@ async function openOfferForm(offer, presetRecipients = []) {
   for (const c of presetRecipients) chosen.set(c.id, c);
 
   const title = h("input", { type: "text", maxlength: "80", placeholder: "e.g. Launch week special", value: offer?.title || "" });
-  const percent = h("input", { type: "number", min: "1", max: "90", step: "1", inputmode: "numeric", value: String(offer?.percent_off ?? 20) });
+  const percent = h("input", { type: "number", min: "1", max: "100", step: "1", inputmode: "numeric", value: String(offer?.percent_off ?? 20) });
   const pkg = h("select", {},
     h("option", { value: "" }, "All packages"),
     catalog.map((c) => h("option", { value: c.id }, `${packageName(c.id)}${c.active === false ? " (not on sale)" : ""}`)));
   pkg.value = offer?.package_id || "";
   const starts = h("input", { type: "datetime-local", value: toLocalInput(offer?.starts_at || new Date()) });
   const ends = h("input", { type: "datetime-local", value: toLocalInput(offer?.ends_at) });
+  const maxClaims = h("input", { type: "number", min: "1", step: "1", inputmode: "numeric", placeholder: "No limit", value: offer?.max_claims ? String(offer.max_claims) : "" });
   const audience = h("select", {},
     h("option", { value: "all" }, "Everyone"),
     h("option", { value: "selected" }, "Only customers I choose"));
@@ -1045,10 +1054,11 @@ async function openOfferForm(offer, presetRecipients = []) {
   function drawPreview() {
     const p = Math.trunc(Number(percent.value));
     const rows = catalog.filter((c) => !pkg.value || c.id === pkg.value);
-    if (!(p >= 1 && p <= 90) || !rows.length) { preview.replaceChildren(h("span", { class: "muted small" }, "Enter a discount between 1% and 90% to see the new prices.")); return; }
+    if (!(p >= 1 && p <= 100) || !rows.length) { preview.replaceChildren(h("span", { class: "muted small" }, "Enter a discount between 1% and 100% to see the new prices.")); return; }
     preview.replaceChildren(h("div", { class: "chart-title" }, "New prices"), ...rows.map((c) => h("div", { class: "list-row" },
       h("span", {}, packageName(c.id)),
-      h("span", {}, h("s", { class: "muted" }, tzs(c.amount)), "  ", h("b", {}, tzs(offerPrice(c.amount, p)))))));
+      h("span", {}, h("s", { class: "muted" }, tzs(c.amount)), "  ", h("b", {}, p >= 100 ? "FREE" : tzs(offerPrice(c.amount, p)))))),
+      ...(p >= 100 ? [h("p", { class: "muted small" }, "100% off: each customer can claim it once, with no payment. Use it for gifts and launch promotions.")] : []));
   }
   [percent, pkg].forEach((el) => el.addEventListener("input", drawPreview));
   drawPreview();
@@ -1097,19 +1107,24 @@ async function openOfferForm(offer, presetRecipients = []) {
     const start = starts.value ? new Date(starts.value) : new Date();
     const end = ends.value ? new Date(ends.value) : null;
     if (!title.value.trim()) return fail("Give the offer a name.");
-    if (!Number.isInteger(p) || p < 1 || p > 90) return fail("The discount must be a whole number between 1% and 90%.");
+    if (!Number.isInteger(p) || p < 1 || p > 100) return fail("The discount must be a whole number between 1% and 100%.");
     if (Number.isNaN(start.getTime()) || (end && Number.isNaN(end.getTime()))) return fail("Check the start and end dates.");
     if (end && end <= start) return fail("The end must be after the start.");
     if (audience.value === "selected" && !chosen.size) return fail("Choose at least one customer, or set “Who” to Everyone.");
     // Pesapal can't take less than TZS 1,000, so no offer may go below it.
     const affected = catalog.filter((c) => c.active !== false && num(c.amount) > 0 && (!pkg.value || c.id === pkg.value));
-    const tooCheap = affected.find((c) => Math.round(num(c.amount) * (100 - p) / 100) < PESAPAL_MINIMUM);
+    // 100% off is free (no payment, so Pesapal's minimum doesn't apply).
+    const tooCheap = p >= 100 ? null : affected.find((c) => Math.round(num(c.amount) * (100 - p) / 100) < PESAPAL_MINIMUM);
     if (tooCheap) {
       return fail(`${p}% off would make ${packageName(tooCheap.id)} cost ${tzs(Math.round(num(tooCheap.amount) * (100 - p) / 100))}. ` +
         `Pesapal can't take less than ${tzs(PESAPAL_MINIMUM)}: choose a smaller discount${pkg.value ? "" : " or one package"}.`);
     }
 
+    const maxRaw = maxClaims.value.trim();
+    const max = maxRaw === "" ? null : Number(maxRaw);
+    if (max !== null && (!Number.isInteger(max) || max < 1)) return fail("“Maximum people” must be a whole number of 1 or more, or empty for no limit.");
     const body = {
+      max_claims: max,
       title: title.value.trim(),
       package_id: pkg.value || null,
       percent_off: p,
@@ -1168,7 +1183,8 @@ async function openOfferForm(offer, presetRecipients = []) {
         h("label", {}, "Discount (%)", percent),
         h("label", {}, "Package", pkg),
         h("label", {}, "Starts", starts),
-        h("label", {}, "Ends (leave empty for no end)", ends)),
+        h("label", {}, "Ends (leave empty for no end)", ends),
+        h("label", {}, "Maximum people (leave empty for no limit)", maxClaims)),
       h("label", {}, "Who gets it", audience),
       picker,
       preview,
