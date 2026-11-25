@@ -802,7 +802,8 @@ async function renderCustomer(root, id) {
 
 async function renderPackages(root) {
   root.append(h("div", { class: "note" },
-    "Changes apply to new purchases only. People who already paid keep the listings and end date they bought. " +
+    "Listing vehicles is free: anyone can show up to 8 at a time, for 30 days each, renewable free. A package adds its extra vehicles on top. " +
+    "Changes apply to new purchases only. People who already paid keep what they bought. " +
     "The app and the website read these prices, and the server always charges the price set here."));
   const grid = h("div", { class: "packages" }, loading());
   root.append(grid);
@@ -832,7 +833,7 @@ function packageEditor(pkg) {
     return [input, h("label", {}, label, input)];
   };
   const [price, priceLabel] = field("Price (TZS)", pkg.amount, { min: "100", step: "100" });
-  const [listings, listingsLabel] = field("Listings allowed", pkg.listing_allowance, { min: "1", max: "500" });
+  const [listings, listingsLabel] = field("Extra vehicles (on top of the free 8)", pkg.listing_allowance, { min: "1", max: "500" });
   const [days, daysLabel] = field("Duration (days)", pkg.validity_days, { min: "1", max: "730" });
   // A bundle sells connection credits (they never expire). A top-up adds
   // customer numbers to a running package. Neither gives listings or a
@@ -876,7 +877,7 @@ function packageEditor(pkg) {
   saveBtn.addEventListener("click", async () => {
     const v = values();
     if (!Number.isInteger(v.amount) || v.amount < PESAPAL_MINIMUM) { toast(`Price must be a whole number of at least ${tzs(PESAPAL_MINIMUM)}: Pesapal can't take less.`, true); return; }
-    if (!topUp && (!Number.isInteger(v.listing_allowance) || v.listing_allowance < 1 || v.listing_allowance > 500)) { toast("Listings must be between 1 and 500.", true); return; }
+    if (!topUp && (!Number.isInteger(v.listing_allowance) || v.listing_allowance < 1 || v.listing_allowance > 500)) { toast("Extra vehicles must be between 1 and 500.", true); return; }
     if (!topUp && (!Number.isInteger(v.validity_days) || v.validity_days < 1 || v.validity_days > 730)) { toast("Duration must be between 1 and 730 days.", true); return; }
     if ("contact_allowance" in v && (!Number.isInteger(v.contact_allowance) || v.contact_allowance < 1 || v.contact_allowance > 5000)) { toast(`${bundle ? "Credits" : "Customer numbers"} must be between 1 and 5000.`, true); return; }
     if (!v.active && saved.active !== false) {
